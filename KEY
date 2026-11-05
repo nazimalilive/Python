@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+KEYGEN - License key generator for Mobile Shop POS Pro   (KEEP THIS FILE PRIVATE)
+
+Yeh chhota tool aap (vendor) ke paas rehta hai, customer ko NAHI dena.
+Jab koi customer software khareede:
+  1) Customer Login screen ya Settings screen se apna "Machine ID" copy kar ke
+     aapko WhatsApp/email kare ga.
+  2) Wahi Machine ID yahan paste karein, expiry choose karein - ek LICENSE KEY
+     ban jayegi.
+  3) Wo key customer ko bhej dein - wo apne Settings > "Activate License" me
+     (ya Login screen ke "Activate License" link se) paste kar dega.
+
+IMPORTANT: LICENSE_SECRET neeche EXACTLY wahi hona chahiye jo Mobile_Shop_POS_Pro.py
+file ke andar hai. Agar aapne wahan LICENSE_SECRET badla hai to yahan bhi wahi
+value daalein, warna generate ki hui key kaam nahi karegi.
+"""
+import hmac
+import hashlib
+from datetime import datetime, date, timedelta
+
+LICENSE_SECRET = b"CHANGE-ME-BEFORE-SELLING-9f3a"   # <-- Mobile_Shop_POS_Pro.py jaisa hi rakhein
+
+
+def _sig(mid, expiry):
+    return hmac.new(LICENSE_SECRET, ("%s|%s" % (mid, expiry)).encode(), hashlib.sha256).hexdigest().upper()[:20]
+
+
+def make_license_key(mid, expiry="LIFETIME"):
+    s = _sig(mid.strip().upper(), expiry)
+    return "%s-%s" % (expiry, "-".join(s[i:i + 5] for i in range(0, 20, 5)))
+
+
+def verify_license_key(key, mid):
+    mid = mid.strip().upper()
+    parts = key.strip().upper().split("-")
+    if len(parts) != 5:
+        return False, "Invalid key format"
+    expiry, sig = parts[0], "".join(parts[1:])
+    if expiry != "LIFETIME":
+        try:
+            exp_date = datetime.strptime(expiry, "%Y%m%d").date()
+        except ValueError:
+            return False, "Invalid key"
+        if exp_date < date.today():
+            return False, "This key already expired on %s" % exp_date
+    if not hmac.compare_digest(sig, _sig(mid, expiry)):
+        return False, "Key does not match this Machine ID"
+    return True, "Valid"
+
+
+def main():
+    print("=" * 62)
+    print(" MOBILE SHOP POS PRO  -  License Key Generator (private tool)")
+    print("=" * 62)
+    while True:
+        print()
+        mid = input("Customer ka Machine ID paste karein (ya 'q' likh kar exit): ").strip()
+        if mid.lower() == "q":
+            break
+        if not mid:
+            continue
+
+        print()
+        print("License kitne arse ke liye chahiye?")
+        print("  1) Lifetime (hamesha ke liye)")
+        print("  2) 1 saal (365 din)")
+        print("  3) Custom din likhein")
+        choice = input("Choice [1/2/3, default 1]: ").strip()
+
+        if choice == "2":
+            expiry = (date.today() + timedelta(days=365)).strftime("%Y%m%d")
+        elif choice == "3":
+            try:
+                days = int(input("Kitne din? ").strip())
+            except ValueError:
+                print("Sahi number likhein. Dobara try karein.")
+                continue
+            expiry = (date.today() + timedelta(days=days)).strftime("%Y%m%d")
+        else:
+            expiry = "LIFETIME"
+
+        key = make_license_key(mid, expiry)
+        ok, msg = verify_license_key(key, mid)
+
+        print()
+        print("-" * 62)
+        print("MACHINE ID  :", mid.strip().upper())
+        print("LICENSE KEY :", key)
+        print("SELF-CHECK  :", "OK, valid" if ok else "PROBLEM: %s" % msg)
+        print("-" * 62)
+        print("Upar wali 'LICENSE KEY' line customer ko bhej dein.")
+
+
+if __name__ == "__main__":
+    main()
+
