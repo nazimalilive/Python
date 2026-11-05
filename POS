@@ -1,0 +1,3505 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AHR POS  -  single file, Python 3.8+  (tkinter + sqlite3 only, no pip needed)
+
+Features : animated login, POS with IMEI tracking, purchases, suppliers, customers (udhar ledger),
+           repair job cards, returns, warranty lookup, expenses, 11 reports, users & roles,
+           invoice print (80mm thermal / A4), PDF (optional reportlab), WhatsApp send,
+           backup / restore, trial + license key activation.
+
+Run      : Thonny -> open this file -> Run.   Default login: admin / admin123 (asks to change).
+Data     : <your home folder>/AHR_POS/  (database, backups, invoices)
+Selling  : 1) change LICENSE_SECRET below   2) put your phone number in VENDOR_PHONE
+           3) keep keygen.py private (same secret)   4) build .exe with PyInstaller.
+"""
+import os
+import sys
+import re
+import csv
+import hmac
+import uuid
+import shutil
+import sqlite3
+import hashlib
+import platform
+import html
+import calendar
+import subprocess
+import webbrowser
+import traceback
+import urllib.parse
+from datetime import datetime, date, timedelta
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+# =====================================================================================
+#  CONFIG  (edit these before selling)
+# =====================================================================================
+APP_NAME = "AHR POS"
+APP_INITIALS = "AHR"
+APP_VERSION = "1.0.0"
+VENDOR_NAME = "Rehmani POS"
+VENDOR_PHONE = "03XX-XXXXXXX"                      # <-- apna number (license kharidne ke liye)
+LICENSE_SECRET = b"CHANGE-ME-BEFORE-SELLING-9f3a"  # <-- BADAL DEIN + keygen.py me same rakhein
+TRIAL_DAYS = 15
+
+DATA_DIR = Path.home() / "AHR_POS"
+DB_PATH = DATA_DIR / "mobile_pos.db"
+BACKUP_DIR = DATA_DIR / "backups"
+INVOICE_DIR = DATA_DIR / "invoices"
+MARKER = Path.home() / ".msp_sys.dat"
+
+WALKIN_ID = 1
+NO_STOCK_CATS = ("Service",)
+CATEGORIES = ["Mobile", "Accessory", "Spare Part", "Card/Load", "Service", "Other"]
+PAY_METHODS = ["Cash", "JazzCash", "EasyPaisa", "Bank Transfer", "Card", "Credit (Udhar)"]
+REPAIR_STATUS = ["Received", "In Progress", "Waiting for Parts", "Ready", "Delivered", "Cancelled"]
+EXPENSE_CATS = ["Rent", "Electricity", "Salary", "Tea/Food", "Transport", "Internet", "Shop Maintenance", "Other"]
+ROLES = ["admin", "manager", "cashier"]
+
+DEFAULT_SETTINGS = {
+    "shop_name": "My Mobile Shop",
+    "shop_address": "Shop address, City",
+    "shop_phone": "03XX-XXXXXXX",
+    "invoice_prefix": "INV",
+    "currency": "Rs",
+    "tax_pct": "0",
+    "paper": "80mm",
+    "country_code": "92",
+    "invoice_footer": "Shukriya! Dobara tashreef layein.",
+    "warranty_note": "Warranty as per shop policy. Physical / water damage is not covered.",
+    "repair_terms": "Data loss ki zimmedari shop par nahi. 30 din baad na uthaye gaye mobile ki zimmedari nahi.",
+    "auto_open_invoice": "0",
+    "last_user": "",
+}
+
+
+def init_dirs():
+    for p in (DATA_DIR, BACKUP_DIR, INVOICE_DIR):
+        p.mkdir(parents=True, exist_ok=True)
+
+
+# =====================================================================================
+#  SMALL HELPERS
+# =====================================================================================
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str():
+    return date.today().strftime("%Y-%m-%d")
+
+
+def to_num(v, default=0.0):
+    try:
+        if v is None:
+            return default
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).replace(",", "").strip()
+        return float(s) if s else default
+    except ValueError:
+        return default
+
+
+def fmt(n):
+    n = to_num(n)
+    if abs(n - round(n)) < 0.005:
+        return "{:,}".format(int(round(n)))
+    return "{:,.2f}".format(n)
+
+
+def add_months(d, m):
+    y = d.year + (d.month - 1 + m) // 12
+    mo = (d.month - 1 + m) % 12 + 1
+    day = min(d.day, calendar.monthrange(y, mo)[1])
+    return d.replace(year=y, month=mo, day=day)
+
+
+def parse_date(s):
+    return datetime.strptime(s.strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+
+
+def hash_pw(pw, salt=None):
+    salt = salt or os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt), 120000).hex()
+    return h, salt
+
+
+def line_total(l):
+    return round(l["qty"] * l["price"] * (1 - l.get("disc_pct", 0) / 100.0), 2)
+
+
+def calc_totals(lines, disc_pct, tax_pct):
+    sub = round(sum(line_total(l) for l in lines), 2)
+    disc_amt = round(sub * disc_pct / 100.0, 2)
+    taxable = sub - disc_amt
+    tax_amt = round(taxable * tax_pct / 100.0, 2)
+    total = round(taxable + tax_amt, 2)
+    return {"sub": sub, "disc_amt": disc_amt, "tax_amt": tax_amt, "total": total}
+
+
+def open_path(p):
+    p = str(p)
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(p)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", p])
+        else:
+            subprocess.Popen(["xdg-open", p])
+    except Exception:
+        pass
+
+
+def open_html(path):
+    webbrowser.open(Path(path).resolve().as_uri())
+
+
+# =====================================================================================
+#  LICENSE  (trial + key tied to this computer)
+# =====================================================================================
+def machine_id():
+    raw = "%s|%s|%s" % (uuid.getnode(), platform.system(), platform.machine())
+    h = hashlib.sha256(raw.encode()).hexdigest().upper()[:16]
+    return "-".join(h[i:i + 4] for i in range(0, 16, 4))
+
+
+def _sig(mid, expiry):
+    return hmac.new(LICENSE_SECRET, ("%s|%s" % (mid, expiry)).encode(), hashlib.sha256).hexdigest().upper()[:20]
+
+
+def make_license_key(mid, expiry="LIFETIME"):
+    s = _sig(mid.strip().upper(), expiry)
+    return "%s-%s" % (expiry, "-".join(s[i:i + 5] for i in range(0, 20, 5)))
+
+
+def verify_license_key(key, mid=None):
+    mid = (mid or machine_id()).strip().upper()
+    parts = key.strip().upper().split("-")
+    if len(parts) != 5:
+        return False, "Invalid key format", ""
+    expiry, sig = parts[0], "".join(parts[1:])
+    if expiry != "LIFETIME":
+        try:
+            exp_date = datetime.strptime(expiry, "%Y%m%d").date()
+        except ValueError:
+            return False, "Invalid key", ""
+        if exp_date < date.today():
+            return False, "This key expired on %s" % exp_date, expiry
+    if not hmac.compare_digest(sig, _sig(mid, expiry)):
+        return False, "This key is not valid for this computer", ""
+    return True, "OK", expiry
+
+
+def _read_marker():
+    d = {}
+    try:
+        for line in MARKER.read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return d
+
+
+def _write_marker(d):
+    try:
+        MARKER.write_text("\n".join("%s=%s" % kv for kv in d.items()))
+    except Exception:
+        pass
+
+
+def license_status(db):
+    """returns dict(state = licensed | trial | expired | tampered, days, text)"""
+    key = db.get_setting("license_key", "")
+    if key:
+        ok, _msg, exp = verify_license_key(key)
+        if ok:
+            if exp == "LIFETIME":
+                return {"state": "licensed", "days": 99999, "text": "Licensed (Lifetime)"}
+            left = (datetime.strptime(exp, "%Y%m%d").date() - date.today()).days
+            return {"state": "licensed", "days": left, "text": "Licensed - %d days left" % left}
+    today = today_str()
+    mk = _read_marker()
+    starts = [x for x in (db.get_setting("trial_start", ""), mk.get("start", "")) if x]
+    start = min(starts) if starts else today
+    lasts = [x for x in (db.get_setting("last_run", ""), mk.get("last", "")) if x]
+    last = max(lasts) if lasts else start
+    if today < last:
+        return {"state": "tampered", "days": 0, "text": "System date was changed - set the correct date"}
+    db.set_setting("trial_start", start)
+    db.set_setting("last_run", today)
+    _write_marker({"start": start, "last": today})
+    used = (date.today() - datetime.strptime(start, "%Y-%m-%d").date()).days
+    left = TRIAL_DAYS - used
+    if left < 0:
+        return {"state": "expired", "days": 0, "text": "Trial expired - please activate a license"}
+    return {"state": "trial", "days": left, "text": "Trial version: %d day(s) left" % left}
+
+
+def activate_license(db, key):
+    ok, msg, _ = verify_license_key(key)
+    if ok:
+        db.set_setting("license_key", key.strip().upper())
+    return ok, msg
+
+
+# =====================================================================================
+#  DATABASE
+# =====================================================================================
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS users(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL COLLATE NOCASE, full_name TEXT DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'cashier', pw_hash TEXT NOT NULL, salt TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1, must_change INTEGER NOT NULL DEFAULT 0, created TEXT);
+CREATE TABLE IF NOT EXISTS products(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, brand TEXT DEFAULT '', category TEXT DEFAULT 'Accessory',
+  barcode TEXT DEFAULT '', cost REAL DEFAULT 0, price REAL DEFAULT 0, stock REAL DEFAULT 0, min_stock REAL DEFAULT 0,
+  track_imei INTEGER DEFAULT 0, warranty_months INTEGER DEFAULT 0, active INTEGER DEFAULT 1, created TEXT);
+CREATE INDEX IF NOT EXISTS ix_prod_name ON products(name);
+CREATE INDEX IF NOT EXISTS ix_prod_barcode ON products(barcode);
+CREATE TABLE IF NOT EXISTS imei_units(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, imei TEXT NOT NULL UNIQUE, cost REAL DEFAULT 0,
+  note TEXT DEFAULT '', status TEXT DEFAULT 'in_stock', purchase_id INTEGER, sale_id INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS customers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT DEFAULT '', address TEXT DEFAULT '',
+  opening REAL DEFAULT 0, active INTEGER DEFAULT 1, created TEXT);
+CREATE TABLE IF NOT EXISTS suppliers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT DEFAULT '', address TEXT DEFAULT '',
+  opening REAL DEFAULT 0, active INTEGER DEFAULT 1, created TEXT);
+CREATE TABLE IF NOT EXISTS sales(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, invoice_no TEXT UNIQUE, date TEXT, customer_id INTEGER,
+  subtotal REAL, disc_pct REAL DEFAULT 0, disc_amt REAL DEFAULT 0, tax_pct REAL DEFAULT 0, tax_amt REAL DEFAULT 0,
+  total REAL, paid REAL, balance_due REAL DEFAULT 0, cost_total REAL DEFAULT 0, method TEXT, user_id INTEGER, note TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS ix_sales_date ON sales(date);
+CREATE INDEX IF NOT EXISTS ix_sales_cust ON sales(customer_id);
+CREATE TABLE IF NOT EXISTS sale_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, sale_id INTEGER NOT NULL, product_id INTEGER, name TEXT, imei TEXT DEFAULT '',
+  qty REAL, price REAL, cost REAL, disc_pct REAL DEFAULT 0, line_total REAL, warranty_months INTEGER DEFAULT 0,
+  returned_qty REAL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ix_si_sale ON sale_items(sale_id);
+CREATE TABLE IF NOT EXISTS purchases(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ref_no TEXT, date TEXT, supplier_id INTEGER, subtotal REAL, disc_pct REAL DEFAULT 0,
+  disc_amt REAL DEFAULT 0, total REAL, paid REAL, balance_due REAL DEFAULT 0, method TEXT, user_id INTEGER, note TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS purchase_items(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, purchase_id INTEGER NOT NULL, product_id INTEGER, name TEXT, qty REAL, cost REAL, line_total REAL);
+CREATE TABLE IF NOT EXISTS payments(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, party_type TEXT, party_id INTEGER, amount REAL, method TEXT,
+  note TEXT DEFAULT '', user_id INTEGER);
+CREATE TABLE IF NOT EXISTS expenses(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, category TEXT, amount REAL, note TEXT DEFAULT '', user_id INTEGER);
+CREATE TABLE IF NOT EXISTS returns(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, sale_id INTEGER, sale_item_id INTEGER, qty REAL, amount REAL,
+  net_amount REAL, cost REAL, balance_adjust REAL DEFAULT 0, cash_refund REAL DEFAULT 0, note TEXT DEFAULT '', user_id INTEGER);
+CREATE TABLE IF NOT EXISTS repairs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, job_no TEXT UNIQUE, date_in TEXT, customer_name TEXT, phone TEXT, device TEXT,
+  imei TEXT DEFAULT '', problem TEXT, estimate REAL DEFAULT 0, advance REAL DEFAULT 0, final_charge REAL DEFAULT 0,
+  parts_cost REAL DEFAULT 0, status TEXT DEFAULT 'Received', technician TEXT DEFAULT '', date_out TEXT,
+  note TEXT DEFAULT '', user_id INTEGER);
+"""
+
+CUST_SQL = """
+SELECT c.id, c.name, c.phone, c.address, c.opening,
+  c.opening
+  + COALESCE((SELECT SUM(s.balance_due) FROM sales s WHERE s.customer_id=c.id),0)
+  - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='customer' AND p.party_id=c.id),0)
+  - COALESCE((SELECT SUM(r.balance_adjust) FROM returns r JOIN sales s2 ON s2.id=r.sale_id WHERE s2.customer_id=c.id),0) AS balance
+FROM customers c """
+
+SUPP_SQL = """
+SELECT c.id, c.name, c.phone, c.address, c.opening,
+  c.opening
+  + COALESCE((SELECT SUM(x.balance_due) FROM purchases x WHERE x.supplier_id=c.id),0)
+  - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.party_type='supplier' AND p.party_id=c.id),0) AS balance
+FROM suppliers c """
+
+
+class DB:
+    def __init__(self, path):
+        self.path = str(path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+        self._seed()
+
+    # ---- basic ----
+    def q(self, sql, args=()):
+        return self.conn.execute(sql, args).fetchall()
+
+    def one(self, sql, args=()):
+        return self.conn.execute(sql, args).fetchone()
+
+    def val(self, sql, args=(), default=0):
+        r = self.conn.execute(sql, args).fetchone()
+        return default if (r is None or r[0] is None) else r[0]
+
+    def x(self, sql, args=()):
+        cur = self.conn.execute(sql, args)
+        self.conn.commit()
+        return cur
+
+    def _seed(self):
+        for k, v in DEFAULT_SETTINGS.items():
+            self.conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+        if not self.val("SELECT COUNT(*) FROM customers"):
+            self.conn.execute("INSERT INTO customers(id,name,created) VALUES(1,'Walk-in Customer',?)", (now_str(),))
+        if not self.val("SELECT COUNT(*) FROM users"):
+            h, s = hash_pw("admin123")
+            self.conn.execute(
+                "INSERT INTO users(username,full_name,role,pw_hash,salt,active,must_change,created) "
+                "VALUES('admin','Administrator','admin',?,?,1,1,?)", (h, s, now_str()))
+        self.conn.commit()
+
+    # ---- settings ----
+    def get_setting(self, key, default=""):
+        r = self.one("SELECT value FROM settings WHERE key=?", (key,))
+        return r["value"] if r else default
+
+    def set_setting(self, key, value):
+        self.x("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+
+    def settings(self):
+        d = dict(DEFAULT_SETTINGS)
+        for r in self.q("SELECT key, value FROM settings"):
+            d[r["key"]] = r["value"]
+        return d
+
+    # ---- users ----
+    def check_login(self, username, password):
+        r = self.one("SELECT * FROM users WHERE username=? AND active=1", (username,))
+        if not r:
+            return None
+        h, _ = hash_pw(password, r["salt"])
+        return r if hmac.compare_digest(h, r["pw_hash"]) else None
+
+    def add_user(self, username, password, role, full_name=""):
+        h, s = hash_pw(password)
+        self.x("INSERT INTO users(username,full_name,role,pw_hash,salt,active,must_change,created) VALUES(?,?,?,?,?,1,0,?)",
+               (username.strip(), full_name.strip(), role, h, s, now_str()))
+
+    def set_password(self, uid, password, must_change=0):
+        h, s = hash_pw(password)
+        self.x("UPDATE users SET pw_hash=?, salt=?, must_change=? WHERE id=?", (h, s, must_change, uid))
+
+    def admin_count(self):
+        return self.val("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1")
+
+    # ---- products ----
+    def search_products(self, text="", category="", limit=300):
+        sql = "SELECT * FROM products WHERE active=1"
+        args = []
+        if text:
+            sql += " AND (name LIKE ? OR brand LIKE ? OR barcode LIKE ?)"
+            args += ["%" + text + "%"] * 3
+        if category and category != "All":
+            sql += " AND category=?"
+            args.append(category)
+        sql += " ORDER BY name COLLATE NOCASE LIMIT %d" % limit
+        return self.q(sql, args)
+
+    def barcode_taken(self, barcode, exclude_id=None):
+        if not barcode:
+            return False
+        r = self.one("SELECT id FROM products WHERE active=1 AND barcode=? AND id<>?", (barcode, exclude_id or 0))
+        return r is not None
+
+    def save_product(self, d, pid=None):
+        vals = (d["name"].strip(), d.get("brand", "").strip(), d.get("category") or "Accessory", d.get("barcode", "").strip(),
+                to_num(d.get("cost")), to_num(d.get("price")), to_num(d.get("stock")), to_num(d.get("min_stock")),
+                1 if d.get("track_imei") else 0, int(to_num(d.get("warranty_months"))))
+        if pid:
+            self.x("UPDATE products SET name=?, brand=?, category=?, barcode=?, cost=?, price=?, stock=?, min_stock=?, "
+                   "track_imei=?, warranty_months=? WHERE id=?", vals + (pid,))
+            self.refresh_stock(pid)
+            return pid
+        cur = self.x("INSERT INTO products(name,brand,category,barcode,cost,price,stock,min_stock,track_imei,warranty_months,created) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?)", vals + (now_str(),))
+        self.refresh_stock(cur.lastrowid)
+        return cur.lastrowid
+
+    def refresh_stock(self, pid, commit=True):
+        self.conn.execute(
+            "UPDATE products SET stock=(SELECT COUNT(*) FROM imei_units WHERE product_id=? AND status='in_stock') "
+            "WHERE id=? AND track_imei=1", (pid, pid))
+        if commit:
+            self.conn.commit()
+
+    def find_imei(self, imei):
+        return self.one("SELECT u.imei, u.cost AS ucost, p.* FROM imei_units u JOIN products p ON p.id=u.product_id "
+                        "WHERE u.imei=? AND u.status='in_stock' AND p.active=1", (imei.strip(),))
+
+    def add_imeis(self, pid, imeis, cost=0.0, note="", purchase_id=None, commit=True):
+        added, dup = 0, []
+        for raw in imeis:
+            im = raw.strip()
+            if not im:
+                continue
+            if self.one("SELECT 1 FROM imei_units WHERE imei=?", (im,)):
+                dup.append(im)
+                continue
+            self.conn.execute("INSERT INTO imei_units(product_id,imei,cost,note,status,purchase_id,created) "
+                              "VALUES(?,?,?,?, 'in_stock', ?, ?)", (pid, im, cost, note, purchase_id, now_str()))
+            added += 1
+        self.refresh_stock(pid, commit=False)
+        if commit:
+            self.conn.commit()
+        return added, dup
+
+    # ---- parties ----
+    def save_party(self, kind, d, pid=None):
+        t = "customers" if kind == "customer" else "suppliers"
+        vals = (d["name"].strip(), d.get("phone", "").strip(), d.get("address", "").strip(), to_num(d.get("opening")))
+        if pid:
+            self.x("UPDATE %s SET name=?, phone=?, address=?, opening=? WHERE id=?" % t, vals + (pid,))
+            return pid
+        return self.x("INSERT INTO %s(name,phone,address,opening,created) VALUES(?,?,?,?,?)" % t, vals + (now_str(),)).lastrowid
+
+    def parties(self, kind, text="", include_walkin=False):
+        sql = (CUST_SQL if kind == "customer" else SUPP_SQL) + " WHERE c.active=1"
+        args = []
+        if kind == "customer" and not include_walkin:
+            sql += " AND c.id<>%d" % WALKIN_ID
+        if text:
+            sql += " AND (c.name LIKE ? OR c.phone LIKE ?)"
+            args += ["%" + text + "%"] * 2
+        sql += " ORDER BY c.name COLLATE NOCASE"
+        return self.q(sql, args)
+
+    def party_balance(self, kind, pid):
+        r = self.one((CUST_SQL if kind == "customer" else SUPP_SQL) + " WHERE c.id=?", (pid,))
+        return r["balance"] if r else 0.0
+
+    def add_payment(self, kind, pid, amount, method, note, uid):
+        if amount <= 0:
+            raise ValueError("Amount must be greater than zero")
+        self.x("INSERT INTO payments(date,party_type,party_id,amount,method,note,user_id) VALUES(?,?,?,?,?,?,?)",
+               (now_str(), kind, pid, amount, method, note, uid))
+
+    def ledger(self, kind, pid):
+        t = "customers" if kind == "customer" else "suppliers"
+        op = self.val("SELECT opening FROM %s WHERE id=?" % t, (pid,))
+        ev = []
+        if kind == "customer":
+            for r in self.q("SELECT date, invoice_no, total, paid FROM sales WHERE customer_id=?", (pid,)):
+                ev.append((r["date"], 1, "Sale", r["invoice_no"], r["total"], r["paid"]))
+            for r in self.q("SELECT r.date, r.balance_adjust, s.invoice_no FROM returns r JOIN sales s ON s.id=r.sale_id "
+                            "WHERE s.customer_id=? AND r.balance_adjust>0", (pid,)):
+                ev.append((r["date"], 2, "Return", r["invoice_no"], 0, r["balance_adjust"]))
+        else:
+            for r in self.q("SELECT date, ref_no, total, paid FROM purchases WHERE supplier_id=?", (pid,)):
+                ev.append((r["date"], 1, "Purchase", r["ref_no"], r["total"], r["paid"]))
+        for r in self.q("SELECT date, amount, method FROM payments WHERE party_type=? AND party_id=?", (kind, pid)):
+            ev.append((r["date"], 3, "Payment", r["method"], 0, r["amount"]))
+        ev.sort(key=lambda e: (e[0], e[1]))
+        rows, bal = [], op
+        if op:
+            rows.append(["", "Opening", "", op, 0, bal])
+        for d, _o, kd, ref, dr, cr in ev:
+            bal += dr - cr
+            rows.append([d[:16], kd, ref, dr, cr, bal])
+        return rows
+
+    # ---- sales ----
+    def create_sale(self, cart, customer_id, disc_pct, tax_pct, paid, method, uid, note=""):
+        if not cart:
+            raise ValueError("Cart is empty")
+        t = calc_totals(cart, disc_pct, tax_pct)
+        total = t["total"]
+        paid = round(min(max(paid, 0.0), total), 2)
+        due = round(total - paid, 2)
+        if due > 0.004 and customer_id == WALKIN_ID:
+            raise ValueError("Walk-in customer must pay in full.\nUdhar / partial payment ke liye customer select karein.")
+        need = {}
+        for it in cart:
+            if not it.get("imei"):
+                need[it["pid"]] = need.get(it["pid"], 0) + it["qty"]
+        with self.conn:
+            for pid, n in need.items():
+                p = self.one("SELECT * FROM products WHERE id=?", (pid,))
+                if not p:
+                    raise ValueError("Product no longer exists")
+                if p["track_imei"]:
+                    raise ValueError("%s: IMEI / serial select karna zaroori hai" % p["name"])
+                if p["category"] not in NO_STOCK_CATS and p["stock"] + 1e-9 < n:
+                    raise ValueError("Not enough stock for %s (available %s)" % (p["name"], fmt(p["stock"])))
+            lines, cost_total = [], 0.0
+            for it in cart:
+                cost = it.get("cost", 0.0)
+                if it.get("imei"):
+                    u = self.one("SELECT * FROM imei_units WHERE imei=? AND status='in_stock'", (it["imei"],))
+                    if not u or u["product_id"] != it["pid"]:
+                        raise ValueError("IMEI %s is not available in stock" % it["imei"])
+                    cost = u["cost"] or cost
+                lines.append((it, cost))
+                cost_total += cost * it["qty"]
+            n = self.val("SELECT COALESCE(MAX(id),0)+1 FROM sales", default=1)
+            inv = "%s-%06d" % (self.get_setting("invoice_prefix", "INV") or "INV", n)
+            cur = self.conn.execute(
+                "INSERT INTO sales(invoice_no,date,customer_id,subtotal,disc_pct,disc_amt,tax_pct,tax_amt,total,paid,balance_due,"
+                "cost_total,method,user_id,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (inv, now_str(), customer_id, t["sub"], disc_pct, t["disc_amt"], tax_pct, t["tax_amt"], total, paid, due,
+                 round(cost_total, 2), method, uid, note))
+            sale_id = cur.lastrowid
+            for it, cost in lines:
+                self.conn.execute(
+                    "INSERT INTO sale_items(sale_id,product_id,name,imei,qty,price,cost,disc_pct,line_total,warranty_months) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (sale_id, it["pid"], it["name"], it.get("imei") or "", it["qty"], it["price"], cost,
+                     it.get("disc_pct", 0), line_total(it), it.get("warranty", 0)))
+                if it.get("imei"):
+                    self.conn.execute("UPDATE imei_units SET status='sold', sale_id=? WHERE imei=?", (sale_id, it["imei"]))
+                    self.refresh_stock(it["pid"], commit=False)
+                else:
+                    self.conn.execute("UPDATE products SET stock=stock-? WHERE id=? AND category NOT IN ('Service')",
+                                      (it["qty"], it["pid"]))
+        return sale_id
+
+    def get_sale(self, sale_id):
+        sale = self.one(
+            "SELECT s.*, c.name AS customer_name, c.phone AS customer_phone, u.full_name AS user_name, u.username AS username "
+            "FROM sales s LEFT JOIN customers c ON c.id=s.customer_id LEFT JOIN users u ON u.id=s.user_id WHERE s.id=?",
+            (sale_id,))
+        items = self.q("SELECT * FROM sale_items WHERE sale_id=? ORDER BY id", (sale_id,))
+        return sale, items
+
+    def return_items(self, sale_id, picks, uid, note=""):
+        """picks = [(sale_item_id, qty)]  ->  (refund_total, adjusted_to_udhar, cash_refund)"""
+        sale = self.one("SELECT * FROM sales WHERE id=?", (sale_id,))
+        if not sale:
+            raise ValueError("Invoice not found")
+        rows = []
+        with self.conn:
+            for sid, qty in picks:
+                it = self.one("SELECT * FROM sale_items WHERE id=? AND sale_id=?", (sid, sale_id))
+                if not it or qty <= 0:
+                    continue
+                if qty > it["qty"] - it["returned_qty"] + 1e-9:
+                    raise ValueError("Return qty is more than sold qty")
+                net = round(it["line_total"] / it["qty"] * qty * (1 - sale["disc_pct"] / 100.0), 2)
+                gross = round(net * (1 + sale["tax_pct"] / 100.0), 2)
+                rows.append((it, qty, net, gross, round(it["cost"] * qty, 2)))
+            if not rows:
+                raise ValueError("Nothing to return")
+            refund = round(sum(r[3] for r in rows), 2)
+            bal = self.party_balance("customer", sale["customer_id"]) if sale["customer_id"] != WALKIN_ID else 0.0
+            adj = round(min(max(bal, 0.0), refund), 2)
+            for it, qty, net, gross, cost in rows:
+                a = round(adj * gross / refund, 2) if refund else 0.0
+                self.conn.execute(
+                    "INSERT INTO returns(date,sale_id,sale_item_id,qty,amount,net_amount,cost,balance_adjust,cash_refund,note,user_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (now_str(), sale_id, it["id"], qty, gross, net, cost, a, round(gross - a, 2), note, uid))
+                self.conn.execute("UPDATE sale_items SET returned_qty=returned_qty+? WHERE id=?", (qty, it["id"]))
+                if it["imei"]:
+                    self.conn.execute("UPDATE imei_units SET status='in_stock', sale_id=NULL WHERE imei=?", (it["imei"],))
+                    self.refresh_stock(it["product_id"], commit=False)
+                else:
+                    self.conn.execute("UPDATE products SET stock=stock+? WHERE id=? AND category NOT IN ('Service')",
+                                      (qty, it["product_id"]))
+        return refund, adj, round(refund - adj, 2)
+
+    # ---- purchases ----
+    def create_purchase(self, supplier_id, lines, disc_pct, paid, method, note, uid):
+        if not lines:
+            raise ValueError("Purchase is empty")
+        subtotal = round(sum(l["qty"] * l["cost"] for l in lines), 2)
+        disc_amt = round(subtotal * disc_pct / 100.0, 2)
+        total = round(subtotal - disc_amt, 2)
+        paid = round(min(max(paid, 0.0), total), 2)
+        with self.conn:
+            n = self.val("SELECT COALESCE(MAX(id),0)+1 FROM purchases", default=1)
+            cur = self.conn.execute(
+                "INSERT INTO purchases(ref_no,date,supplier_id,subtotal,disc_pct,disc_amt,total,paid,balance_due,method,user_id,note) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("PUR-%05d" % n, now_str(), supplier_id, subtotal, disc_pct, disc_amt, total, paid, round(total - paid, 2),
+                 method, uid, note))
+            purchase_id = cur.lastrowid
+            for l in lines:
+                p = self.one("SELECT * FROM products WHERE id=?", (l["pid"],))
+                if not p:
+                    raise ValueError("Product missing")
+                self.conn.execute("INSERT INTO purchase_items(purchase_id,product_id,name,qty,cost,line_total) VALUES(?,?,?,?,?,?)",
+                                  (purchase_id, l["pid"], l["name"], l["qty"], l["cost"], round(l["qty"] * l["cost"], 2)))
+                if p["track_imei"]:
+                    added, dup = self.add_imeis(l["pid"], l.get("imeis", []), l["cost"], l.get("note", ""), purchase_id, commit=False)
+                    if dup:
+                        raise ValueError("These IMEI already exist:\n" + "\n".join(dup[:8]))
+                else:
+                    self.conn.execute("UPDATE products SET stock=stock+? WHERE id=?", (l["qty"], l["pid"]))
+                self.conn.execute("UPDATE products SET cost=? WHERE id=?", (l["cost"], l["pid"]))
+        return purchase_id
+
+    # ---- repairs ----
+    def save_repair(self, d, uid, rid=None):
+        status = d.get("status") or "Received"
+        date_out = None
+        if rid:
+            date_out = self.one("SELECT date_out FROM repairs WHERE id=?", (rid,))["date_out"]
+        final = to_num(d.get("final_charge"))
+        if status == "Delivered":
+            date_out = date_out or now_str()
+            if not final:
+                final = to_num(d.get("estimate"))
+        else:
+            date_out = None
+        vals = (d["customer_name"].strip(), d.get("phone", "").strip(), d["device"].strip(), d.get("imei", "").strip(),
+                d.get("problem", "").strip(), to_num(d.get("estimate")), to_num(d.get("advance")), final,
+                to_num(d.get("parts_cost")), status, d.get("technician", "").strip(), date_out, d.get("note", "").strip())
+        if rid:
+            self.x("UPDATE repairs SET customer_name=?, phone=?, device=?, imei=?, problem=?, estimate=?, advance=?, final_charge=?, "
+                   "parts_cost=?, status=?, technician=?, date_out=?, note=? WHERE id=?", vals + (rid,))
+            return rid
+        n = self.val("SELECT COALESCE(MAX(id),0)+1 FROM repairs", default=1)
+        return self.x("INSERT INTO repairs(customer_name,phone,device,imei,problem,estimate,advance,final_charge,parts_cost,status,"
+                      "technician,date_out,note,job_no,date_in,user_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      vals + ("JOB-%04d" % n, now_str(), uid)).lastrowid
+
+    # ---- lookups / stats ----
+    def imei_lookup(self, imei):
+        u = self.one("SELECT u.*, p.name AS pname, p.brand AS pbrand FROM imei_units u JOIN products p ON p.id=u.product_id "
+                     "WHERE u.imei=?", (imei.strip(),))
+        if not u:
+            return None
+        info = dict(u)
+        info.update(invoice="", sold_on="", customer="", phone="", warranty_until=None, warranty_active=False, wm=0)
+        if u["sale_id"]:
+            s = self.one("SELECT s.invoice_no, s.date, c.name AS cname, c.phone AS cphone FROM sales s "
+                         "LEFT JOIN customers c ON c.id=s.customer_id WHERE s.id=?", (u["sale_id"],))
+            it = self.one("SELECT warranty_months FROM sale_items WHERE sale_id=? AND imei=?", (u["sale_id"], u["imei"]))
+            wm = it["warranty_months"] if it else 0
+            info.update(invoice=s["invoice_no"], sold_on=s["date"], customer=s["cname"], phone=s["cphone"], wm=wm)
+            if wm:
+                exp = add_months(datetime.strptime(s["date"][:10], "%Y-%m-%d").date(), wm)
+                info["warranty_until"] = exp
+                info["warranty_active"] = exp >= date.today()
+        return info
+
+    def summary(self, d1, d2):
+        s = self.one("SELECT COUNT(*) n, COALESCE(SUM(total),0) total, COALESCE(SUM(total-tax_amt),0) net, "
+                     "COALESCE(SUM(cost_total),0) cost, COALESCE(SUM(disc_amt),0) disc FROM sales "
+                     "WHERE substr(date,1,10) BETWEEN ? AND ?", (d1, d2))
+        r = self.one("SELECT COALESCE(SUM(amount),0) gross, COALESCE(SUM(net_amount),0) net, COALESCE(SUM(cost),0) cost "
+                     "FROM returns WHERE substr(date,1,10) BETWEEN ? AND ?", (d1, d2))
+        rp = self.one("SELECT COUNT(*) n, COALESCE(SUM(final_charge),0) rev, COALESCE(SUM(parts_cost),0) cost FROM repairs "
+                      "WHERE status='Delivered' AND substr(date_out,1,10) BETWEEN ? AND ?", (d1, d2))
+        ex = self.val("SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date BETWEEN ? AND ?", (d1, d2))
+        goods = s["net"] - r["net"] - (s["cost"] - r["cost"])
+        repair = rp["rev"] - rp["cost"]
+        return {
+            "invoices": s["n"], "gross_sales": s["total"], "returns": r["gross"], "net_sales": s["total"] - r["gross"],
+            "discount": s["disc"], "goods_profit": goods, "repair_jobs": rp["n"], "repair_rev": rp["rev"],
+            "repair_profit": repair, "gross_profit": goods + repair, "expenses": ex, "net_profit": goods + repair - ex,
+            "cogs": s["cost"] - r["cost"], "sales_ex_tax": s["net"], "returns_net": r["net"],
+        }
+
+    def receivable(self):
+        return self.val("SELECT COALESCE(SUM(balance),0) FROM (" + CUST_SQL + " WHERE c.active=1) WHERE balance>0.005")
+
+    def payable(self):
+        return self.val("SELECT COALESCE(SUM(balance),0) FROM (" + SUPP_SQL + " WHERE c.active=1) WHERE balance>0.005")
+
+    def stock_value(self):
+        a = self.val("SELECT COALESCE(SUM(stock*cost),0) FROM products WHERE active=1 AND track_imei=0 AND category<>'Service'")
+        b = self.val("SELECT COALESCE(SUM(u.cost),0) FROM imei_units u JOIN products p ON p.id=u.product_id "
+                     "WHERE u.status='in_stock' AND p.active=1")
+        return a + b
+
+    def low_stock(self):
+        return self.q("SELECT * FROM products WHERE active=1 AND category<>'Service' AND min_stock>0 AND stock<=min_stock "
+                      "ORDER BY name COLLATE NOCASE")
+
+    def pending_repairs(self):
+        return self.val("SELECT COUNT(*) FROM repairs WHERE status IN ('Received','In Progress','Waiting for Parts','Ready')")
+
+
+def backup_db(db, keep=30, tag="auto"):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUP_DIR / ("backup_%s_%s.db" % (datetime.now().strftime("%Y%m%d_%H%M%S"), tag))
+    dst = sqlite3.connect(str(dest))
+    try:
+        db.conn.backup(dst)
+    finally:
+        dst.close()
+    for f in sorted(BACKUP_DIR.glob("backup_*.db"))[:-keep]:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return dest
+
+
+# =====================================================================================
+#  REPORTS  (each returns headers, rows, total_row_or_None)
+# =====================================================================================
+def rep_sales_summary(db, d1, d2):
+    hdr = ["Date", "Invoices", "Gross Sales", "Discount", "Returns", "Net Sales", "Profit"]
+    sales = dict((r["d"], r) for r in db.q(
+        "SELECT substr(date,1,10) d, COUNT(*) n, SUM(total) total, SUM(disc_amt) disc, SUM(total-tax_amt-cost_total) profit "
+        "FROM sales WHERE substr(date,1,10) BETWEEN ? AND ? GROUP BY d", (d1, d2)))
+    rets = dict((r["d"], r) for r in db.q(
+        "SELECT substr(date,1,10) d, SUM(amount) gross, SUM(net_amount-cost) prof FROM returns "
+        "WHERE substr(date,1,10) BETWEEN ? AND ? GROUP BY d", (d1, d2)))
+    rows = []
+    for d in sorted(set(sales) | set(rets)):
+        s, r = sales.get(d), rets.get(d)
+        g = s["total"] if s else 0
+        rr = r["gross"] if r else 0
+        rows.append([d, s["n"] if s else 0, g, s["disc"] if s else 0, rr, g - rr,
+                     (s["profit"] if s else 0) - (r["prof"] if r else 0)])
+    tot = ["TOTAL"] + [sum(r[i] for r in rows) for i in range(1, 7)] if rows else None
+    return hdr, rows, tot
+
+
+def rep_sales_detail(db, d1, d2):
+    hdr = ["Invoice", "Date", "Customer", "Total", "Paid", "Due", "Method", "User"]
+    rows = [[r["invoice_no"], r["date"][:16], r["cn"], r["total"], r["paid"], r["balance_due"], r["method"], r["un"]]
+            for r in db.q("SELECT s.*, c.name cn, u.username un FROM sales s LEFT JOIN customers c ON c.id=s.customer_id "
+                          "LEFT JOIN users u ON u.id=s.user_id WHERE substr(s.date,1,10) BETWEEN ? AND ? ORDER BY s.id", (d1, d2))]
+    tot = ["TOTAL", "", "", sum(r[3] for r in rows), sum(r[4] for r in rows), sum(r[5] for r in rows), "", ""] if rows else None
+    return hdr, rows, tot
+
+
+def rep_profit_product(db, d1, d2):
+    hdr = ["Product", "Qty Sold", "Revenue", "Cost", "Profit"]
+    rows = []
+    for r in db.q("SELECT si.name, SUM(si.qty-si.returned_qty) q, SUM((si.qty-si.returned_qty)*si.price*(1-si.disc_pct/100.0)) rev, "
+                  "SUM((si.qty-si.returned_qty)*si.cost) cost FROM sale_items si JOIN sales s ON s.id=si.sale_id "
+                  "WHERE substr(s.date,1,10) BETWEEN ? AND ? GROUP BY si.product_id, si.name ORDER BY rev DESC", (d1, d2)):
+        rows.append([r["name"], r["q"], r["rev"], r["cost"], r["rev"] - r["cost"]])
+    tot = ["TOTAL", sum(r[1] for r in rows), sum(r[2] for r in rows), sum(r[3] for r in rows), sum(r[4] for r in rows)] if rows else None
+    return hdr, rows, tot
+
+
+def rep_stock(db, d1, d2):
+    hdr = ["Product", "Brand", "Category", "Stock", "Cost", "Price", "Stock Value (cost)", "Stock Value (retail)"]
+    rows = [[r["name"], r["brand"], r["category"], r["stock"], r["cost"], r["price"], r["stock"] * r["cost"], r["stock"] * r["price"]]
+            for r in db.q("SELECT * FROM products WHERE active=1 AND category<>'Service' ORDER BY name COLLATE NOCASE")]
+    tot = ["TOTAL", "", "", sum(r[3] for r in rows), "", "", sum(r[6] for r in rows), sum(r[7] for r in rows)] if rows else None
+    return hdr, rows, tot
+
+
+def rep_low_stock(db, d1, d2):
+    hdr = ["Product", "Brand", "Category", "Stock", "Min Level"]
+    return hdr, [[r["name"], r["brand"], r["category"], r["stock"], r["min_stock"]] for r in db.low_stock()], None
+
+
+def rep_customer_udhar(db, d1, d2):
+    hdr = ["Customer", "Phone", "Balance (Udhar)"]
+    rows = [[r["name"], r["phone"], r["balance"]] for r in db.parties("customer") if abs(r["balance"]) > 0.004]
+    rows.sort(key=lambda r: -r[2])
+    return hdr, rows, (["TOTAL", "", sum(r[2] for r in rows)] if rows else None)
+
+
+def rep_supplier_payable(db, d1, d2):
+    hdr = ["Supplier", "Phone", "Payable"]
+    rows = [[r["name"], r["phone"], r["balance"]] for r in db.parties("supplier") if abs(r["balance"]) > 0.004]
+    rows.sort(key=lambda r: -r[2])
+    return hdr, rows, (["TOTAL", "", sum(r[2] for r in rows)] if rows else None)
+
+
+def rep_expenses(db, d1, d2):
+    hdr = ["Category", "Entries", "Amount"]
+    rows = [[r["category"], r["n"], r["a"]] for r in db.q(
+        "SELECT category, COUNT(*) n, SUM(amount) a FROM expenses WHERE date BETWEEN ? AND ? GROUP BY category ORDER BY a DESC", (d1, d2))]
+    return hdr, rows, (["TOTAL", sum(r[1] for r in rows), sum(r[2] for r in rows)] if rows else None)
+
+
+def rep_repairs(db, d1, d2):
+    hdr = ["Job", "Delivered", "Customer", "Device", "Charge", "Parts Cost", "Profit"]
+    rows = [[r["job_no"], (r["date_out"] or "")[:10], r["customer_name"], r["device"], r["final_charge"], r["parts_cost"],
+             r["final_charge"] - r["parts_cost"]] for r in db.q(
+        "SELECT * FROM repairs WHERE status='Delivered' AND substr(date_out,1,10) BETWEEN ? AND ? ORDER BY date_out", (d1, d2))]
+    return hdr, rows, (["TOTAL", "", "", "", sum(r[4] for r in rows), sum(r[5] for r in rows), sum(r[6] for r in rows)] if rows else None)
+
+
+def rep_pnl(db, d1, d2):
+    s = db.summary(d1, d2)
+    hdr = ["Item", "Amount"]
+    rows = [["Gross sales (incl. tax)", s["gross_sales"]], ["Less: returns", -s["returns"]], ["Net sales", s["net_sales"]],
+            ["Discount given (info)", s["discount"]], ["Cost of goods sold", s["cogs"]], ["Profit on goods", s["goods_profit"]],
+            ["Repair income (%d jobs)" % s["repair_jobs"], s["repair_rev"]], ["Profit on repairs", s["repair_profit"]],
+            ["Gross profit", s["gross_profit"]], ["Less: expenses", -s["expenses"]]]
+    return hdr, rows, ["NET PROFIT", s["net_profit"]]
+
+
+def rep_imei_stock(db, d1, d2):
+    hdr = ["Product", "IMEI / Serial", "Color / Note", "Cost", "Price"]
+    rows = [[r["name"], r["imei"], r["note"], r["cost"], r["price"]] for r in db.q(
+        "SELECT p.name, p.price, u.imei, u.note, u.cost FROM imei_units u JOIN products p ON p.id=u.product_id "
+        "WHERE u.status='in_stock' AND p.active=1 ORDER BY p.name, u.imei")]
+    return hdr, rows, (["TOTAL", len(rows), "", sum(r[3] for r in rows), ""] if rows else None)
+
+
+REPORTS = [
+    ("Sales Summary (daily)", rep_sales_summary), ("Sales Detail (invoices)", rep_sales_detail),
+    ("Profit by Product", rep_profit_product), ("Profit & Loss", rep_pnl), ("Stock Report", rep_stock),
+    ("Low Stock", rep_low_stock), ("IMEI Stock (phones in stock)", rep_imei_stock),
+    ("Customer Udhar", rep_customer_udhar), ("Supplier Payable", rep_supplier_payable),
+    ("Expenses by Category", rep_expenses), ("Repairs Report", rep_repairs),
+]
+
+
+# =====================================================================================
+#  INVOICE / RECEIPT / WHATSAPP / PDF
+# =====================================================================================
+def _e(x):
+    return html.escape("" if x is None else str(x))
+
+
+CSS_THERMAL = ("@page{size:80mm auto;margin:3mm}body{font-family:Arial,sans-serif;font-size:12px;width:74mm;margin:0 auto;color:#000}"
+               "h1{font-size:16px;text-align:center;margin:2px 0}.c{text-align:center}.r{text-align:right}.sm{font-size:10px;color:#333}"
+               "table{width:100%;border-collapse:collapse}th,td{padding:3px 2px;border-bottom:1px dashed #888;text-align:left;vertical-align:top}"
+               ".tot td{border:0;padding:2px}.big td{font-size:14px;font-weight:bold;border-top:1px solid #000}")
+CSS_A4 = ("@page{size:A4;margin:14mm}body{font-family:Arial,sans-serif;font-size:14px;max-width:780px;margin:0 auto;color:#111}"
+          "h1{font-size:26px;margin:2px 0}.c{text-align:center}.r{text-align:right}.sm{font-size:12px;color:#555}"
+          "table{width:100%;border-collapse:collapse}th{background:#eef2f7}th,td{padding:7px 6px;border-bottom:1px solid #ccc;text-align:left;vertical-align:top}"
+          ".tot td{border:0;padding:3px 6px}.big td{font-size:17px;font-weight:bold;border-top:2px solid #000}")
+PRINT_JS = "<script>window.onload=function(){setTimeout(function(){window.print()},300)}</script>"
+
+
+def _page(title, css, body, auto_print=True):
+    return ("<!doctype html><html><head><meta charset='utf-8'><title>%s</title><style>%s</style></head><body>%s%s</body></html>"
+            % (_e(title), css, body, PRINT_JS if auto_print else ""))
+
+
+def invoice_html(sale, items, cfg, auto_print=True):
+    sale = dict(sale)
+    cur = cfg.get("currency", "Rs")
+    css = CSS_A4 if cfg.get("paper") == "A4" else CSS_THERMAL
+    rows = ""
+    for i, it in enumerate(items, 1):
+        extra = ""
+        if it["imei"]:
+            extra += "<div class='sm'>IMEI/SN: %s</div>" % _e(it["imei"])
+        if it["warranty_months"]:
+            extra += "<div class='sm'>Warranty: %s month(s)</div>" % _e(it["warranty_months"])
+        disc = ("%s%%" % fmt(it["disc_pct"])) if it["disc_pct"] else ""
+        rows += ("<tr><td>%d</td><td>%s%s</td><td class='r'>%s</td><td class='r'>%s</td><td class='r'>%s</td><td class='r'>%s</td></tr>"
+                 % (i, _e(it["name"]), extra, fmt(it["qty"]), fmt(it["price"]), disc, fmt(it["line_total"])))
+    tot = "<tr><td>Subtotal</td><td class='r'>%s</td></tr>" % fmt(sale["subtotal"])
+    if sale["disc_amt"]:
+        tot += "<tr><td>Discount (%s%%)</td><td class='r'>-%s</td></tr>" % (fmt(sale["disc_pct"]), fmt(sale["disc_amt"]))
+    if sale["tax_amt"]:
+        tot += "<tr><td>Tax (%s%%)</td><td class='r'>%s</td></tr>" % (fmt(sale["tax_pct"]), fmt(sale["tax_amt"]))
+    tot += "<tr class='big'><td>TOTAL</td><td class='r'>%s %s</td></tr>" % (_e(cur), fmt(sale["total"]))
+    tot += "<tr><td>Paid (%s)</td><td class='r'>%s</td></tr>" % (_e(sale["method"]), fmt(sale["paid"]))
+    if sale["balance_due"] > 0.004:
+        tot += "<tr><td><b>Balance Due</b></td><td class='r'><b>%s</b></td></tr>" % fmt(sale["balance_due"])
+    body = ("<h1>%s</h1><div class='c sm'>%s<br>%s</div><hr>"
+            "<div>Invoice: <b>%s</b><br>Date: %s<br>Customer: %s %s<br>Cashier: %s</div><br>"
+            "<table><tr><th>#</th><th>Item</th><th class='r'>Qty</th><th class='r'>Price</th><th class='r'>Disc</th><th class='r'>Total</th></tr>%s</table>"
+            "<table class='tot'>%s</table><hr><div class='sm'>%s</div><div class='c'><b>%s</b></div>"
+            % (_e(cfg.get("shop_name")), _e(cfg.get("shop_address")), _e(cfg.get("shop_phone")), _e(sale["invoice_no"]),
+               _e(sale["date"][:16]), _e(sale.get("customer_name")), _e(sale.get("customer_phone") or ""),
+               _e(sale.get("user_name") or sale.get("username")), rows, tot, _e(cfg.get("warranty_note")), _e(cfg.get("invoice_footer"))))
+    return _page(sale["invoice_no"], css, body, auto_print)
+
+
+def repair_slip_html(job, cfg, auto_print=True):
+    job = dict(job)
+    cur = cfg.get("currency", "Rs")
+    body = ("<h1>%s</h1><div class='c sm'>%s | %s</div><hr><h3 class='c'>REPAIR JOB SLIP</h3>"
+            "<table><tr><td>Job No</td><td><b>%s</b></td></tr><tr><td>Date</td><td>%s</td></tr><tr><td>Customer</td><td>%s</td></tr>"
+            "<tr><td>Phone</td><td>%s</td></tr><tr><td>Device</td><td>%s</td></tr><tr><td>IMEI</td><td>%s</td></tr>"
+            "<tr><td>Problem</td><td>%s</td></tr><tr><td>Estimate</td><td>%s %s</td></tr><tr><td>Advance</td><td>%s %s</td></tr>"
+            "<tr><td>Status</td><td>%s</td></tr></table><hr><div class='sm'>%s</div>"
+            % (_e(cfg.get("shop_name")), _e(cfg.get("shop_address")), _e(cfg.get("shop_phone")), _e(job["job_no"]),
+               _e(job["date_in"][:16]), _e(job["customer_name"]), _e(job["phone"]), _e(job["device"]), _e(job["imei"]),
+               _e(job["problem"]), _e(cur), fmt(job["estimate"]), _e(cur), fmt(job["advance"]), _e(job["status"]),
+               _e(cfg.get("repair_terms"))))
+    return _page(job["job_no"], CSS_THERMAL, body, auto_print)
+
+
+def table_html(title, headers, rows, cfg, subtitle="", auto_print=True):
+    th = "".join("<th>%s</th>" % _e(h) for h in headers)
+    trs = ""
+    for r in rows:
+        tds = ""
+        for v in r:
+            num = isinstance(v, (int, float)) and not isinstance(v, bool)
+            tds += "<td%s>%s</td>" % (" class='r'" if num else "", _e(fmt(v) if num else v))
+        trs += "<tr>%s</tr>" % tds
+    body = ("<h1 class='c'>%s</h1><div class='c sm'>%s</div><h3>%s</h3><div class='sm'>%s</div><br><table><tr>%s</tr>%s</table>"
+            % (_e(cfg.get("shop_name")), _e(cfg.get("shop_phone")), _e(title), _e(subtitle), th, trs))
+    return _page(title, CSS_A4, body, auto_print)
+
+
+def receipt_text(sale, items, cfg):
+    sale = dict(sale)
+    cur = cfg.get("currency", "Rs")
+    L = ["*%s*" % cfg.get("shop_name", ""), "%s | %s" % (cfg.get("shop_address", ""), cfg.get("shop_phone", "")), "",
+         "Invoice: %s" % sale["invoice_no"], "Date: %s" % sale["date"][:16], "Customer: %s" % (sale.get("customer_name") or ""), ""]
+    for i, it in enumerate(items, 1):
+        s = "%d. %s x%s = %s %s" % (i, it["name"], fmt(it["qty"]), cur, fmt(it["line_total"]))
+        if it["imei"]:
+            s += "\n    IMEI: %s" % it["imei"]
+        L.append(s)
+    L.append("------------------")
+    L.append("Subtotal: %s %s" % (cur, fmt(sale["subtotal"])))
+    if sale["disc_amt"]:
+        L.append("Discount (%s%%): -%s" % (fmt(sale["disc_pct"]), fmt(sale["disc_amt"])))
+    if sale["tax_amt"]:
+        L.append("Tax (%s%%): %s" % (fmt(sale["tax_pct"]), fmt(sale["tax_amt"])))
+    L.append("*TOTAL: %s %s*" % (cur, fmt(sale["total"])))
+    L.append("Paid: %s %s (%s)" % (cur, fmt(sale["paid"]), sale["method"]))
+    if sale["balance_due"] > 0.004:
+        L.append("*Baqaya (Udhar): %s %s*" % (cur, fmt(sale["balance_due"])))
+    L += ["", cfg.get("warranty_note", ""), cfg.get("invoice_footer", "")]
+    return "\n".join(L)
+
+
+def wa_number(phone, cc="92"):
+    d = re.sub(r"\D", "", phone or "")
+    if d.startswith("00"):
+        d = d[2:]
+    if d.startswith("0"):
+        d = cc + d[1:]
+    elif len(d) == 10:
+        d = cc + d
+    return d
+
+
+def wa_link(phone, text, cc="92"):
+    return "https://wa.me/%s?text=%s" % (wa_number(phone, cc), urllib.parse.quote(text))
+
+
+def invoice_pdf(sale, items, cfg, path):
+    """needs reportlab (Thonny: Tools > Manage packages > reportlab). Raises ImportError if missing."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer
+    sale = dict(sale)
+    cur = cfg.get("currency", "Rs")
+    st = getSampleStyleSheet()
+    doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=15 * mm, bottomMargin=15 * mm)
+    E = [Paragraph("<b>%s</b>" % _e(cfg.get("shop_name")), st["Title"]),
+         Paragraph("%s | %s" % (_e(cfg.get("shop_address")), _e(cfg.get("shop_phone"))), st["Normal"]), Spacer(1, 8),
+         Paragraph("<b>Invoice:</b> %s &nbsp;&nbsp; <b>Date:</b> %s" % (_e(sale["invoice_no"]), _e(sale["date"][:16])), st["Normal"]),
+         Paragraph("<b>Customer:</b> %s %s" % (_e(sale.get("customer_name")), _e(sale.get("customer_phone") or "")), st["Normal"]),
+         Spacer(1, 10)]
+    data = [["#", "Item", "Qty", "Price", "Disc", "Total"]]
+    for i, it in enumerate(items, 1):
+        name = it["name"] + (("\nIMEI/SN: " + it["imei"]) if it["imei"] else "")
+        data.append([str(i), name, fmt(it["qty"]), fmt(it["price"]), ("%s%%" % fmt(it["disc_pct"])) if it["disc_pct"] else "", fmt(it["line_total"])])
+    tb = Table(data, colWidths=[10 * mm, 90 * mm, 15 * mm, 25 * mm, 15 * mm, 25 * mm], repeatRows=1)
+    tb.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8EDF5")), ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+                            ("ALIGN", (2, 0), (-1, -1), "RIGHT"), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    E += [tb, Spacer(1, 10)]
+    tdata = [["Subtotal", fmt(sale["subtotal"])]]
+    if sale["disc_amt"]:
+        tdata.append(["Discount (%s%%)" % fmt(sale["disc_pct"]), "-" + fmt(sale["disc_amt"])])
+    if sale["tax_amt"]:
+        tdata.append(["Tax (%s%%)" % fmt(sale["tax_pct"]), fmt(sale["tax_amt"])])
+    total_idx = len(tdata)
+    tdata += [["TOTAL (%s)" % cur, fmt(sale["total"])], ["Paid (%s)" % sale["method"], fmt(sale["paid"])]]
+    if sale["balance_due"] > 0.004:
+        tdata.append(["Balance Due", fmt(sale["balance_due"])])
+    tt = Table(tdata, colWidths=[45 * mm, 30 * mm], hAlign="RIGHT")
+    tt.setStyle(TableStyle([("ALIGN", (1, 0), (1, -1), "RIGHT"), ("FONTNAME", (0, total_idx), (-1, total_idx), "Helvetica-Bold")]))
+    E += [tt, Spacer(1, 14), Paragraph(_e(cfg.get("warranty_note")), st["Normal"]),
+          Paragraph("<b>%s</b>" % _e(cfg.get("invoice_footer")), st["Normal"])]
+    doc.build(E)
+    return str(path)
+
+
+# =====================================================================================
+#  ==== UI ====
+# =====================================================================================
+C = {"bg": "#F1F5F9", "side": "#0F172A", "side2": "#1E293B", "accent": "#2563EB", "accent2": "#1D4ED8",
+     "ok": "#16A34A", "ok2": "#15803D", "warn": "#F59E0B", "bad": "#DC2626", "bad2": "#B91C1C", "text": "#0F172A",
+     "mute": "#64748B", "card": "#FFFFFF", "line": "#E2E8F0", "neutral": "#64748B", "neutral2": "#475569"}
+FONT = ("Segoe UI", 10)
+FONT_B = ("Segoe UI", 10, "bold")
+FONT_S = ("Segoe UI", 9)
+FONT_H = ("Segoe UI", 16, "bold")
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def lerp_color(a, b, t):
+    ra, rb = hex_rgb(a), hex_rgb(b)
+    return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(ra, rb))
+
+
+def plain(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    return str(v)
+
+
+def parse_imeis(text):
+    valid, bad, seen = [], [], set()
+    for tok in re.split(r"[\s,;]+", text.strip()):
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        (valid if re.fullmatch(r"[A-Za-z0-9]{6,20}", tok) else bad).append(tok)
+    return valid, bad
+
+
+def setup_style(root):
+    st = ttk.Style(root)
+    try:
+        st.theme_use("clam")
+    except tk.TclError:
+        pass
+    st.configure("Treeview", rowheight=27, font=FONT, background="white", fieldbackground="white", borderwidth=0)
+    st.configure("Treeview.Heading", font=FONT_B, background="#E8EDF5", foreground=C["text"], relief="flat", padding=6)
+    st.map("Treeview", background=[("selected", C["accent"])], foreground=[("selected", "white")])
+    st.configure("TCombobox", padding=4)
+
+
+# =====================================================================================
+#  BASIC WIDGETS
+# =====================================================================================
+class HoverButton(tk.Label):
+    """Flat button with smooth colour-fade hover animation."""
+
+    def __init__(self, parent, text, command=None, bg=None, hover=None, fg="white", font=None, padx=14, pady=7):
+        base = bg or C["accent"]
+        super().__init__(parent, text=text, bg=base, fg=fg, font=font or FONT_B, padx=padx, pady=pady, cursor="hand2")
+        self.base, self.hov, self.cmd = base, hover or C["accent2"], command
+        self._t, self._dir, self._job = 0.0, 0, None
+        self.bind("<Enter>", lambda e: self._go(1))
+        self.bind("<Leave>", lambda e: self._go(-1))
+        self.bind("<Button-1>", self._click)
+
+    def _go(self, d):
+        self._dir = d
+        if self._job is None:
+            self._step()
+
+    def _step(self):
+        self._job = None
+        self._t = min(1.0, max(0.0, self._t + 0.25 * self._dir))
+        try:
+            self.config(bg=lerp_color(self.base, self.hov, self._t))
+            if (self._dir > 0 and self._t < 1.0) or (self._dir < 0 and self._t > 0.0):
+                self._job = self.after(18, self._step)
+        except tk.TclError:
+            pass
+
+    def _click(self, _e=None):
+        if self.cmd:
+            self.cmd()
+
+
+KINDS = {"primary": ("accent", "accent2"), "success": ("ok", "ok2"), "danger": ("bad", "bad2"),
+         "neutral": ("neutral", "neutral2"), "warn": ("warn", "#D97706")}
+
+
+def btn(parent, text, cmd=None, kind="primary", small=False):
+    a, b = KINDS[kind]
+    return HoverButton(parent, text, cmd, bg=C.get(a, a), hover=C.get(b, b), font=FONT_S if small else FONT_B,
+                       padx=10 if small else 14, pady=4 if small else 7)
+
+
+def entry(parent, var=None, width=22, show=None, justify="left"):
+    return tk.Entry(parent, textvariable=var, width=width, relief="flat", bg="white", fg=C["text"], font=FONT,
+                    highlightthickness=1, highlightbackground=C["line"], highlightcolor=C["accent"],
+                    insertbackground=C["text"], show=show or "", justify=justify)
+
+
+def center_on(win, parent=None, w=None, h=None):
+    win.update_idletasks()
+    w = w or win.winfo_reqwidth()
+    h = h or win.winfo_reqheight()
+    if parent is not None:
+        top = parent.winfo_toplevel()
+        x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - h) // 2
+    else:
+        x = (win.winfo_screenwidth() - w) // 2
+        y = (win.winfo_screenheight() - h) // 2
+    win.geometry("%dx%d+%d+%d" % (w, h, max(0, x), max(0, y)))
+
+
+class Modal(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._prev = None
+
+    def go_modal(self, parent, w=None, h=None):
+        self.transient(parent.winfo_toplevel())
+        center_on(self, parent, w, h)
+        try:
+            self._prev = self.grab_current()
+        except tk.TclError:
+            self._prev = None
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.focus_set()
+
+    def destroy(self):
+        prev = self._prev
+        super().destroy()
+        if prev is not None:
+            try:
+                prev.grab_set()
+            except tk.TclError:
+                pass
+
+
+def _fmtv(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, (int, float)):
+        return fmt(v)
+    return str(v)
+
+
+def _sortkey(s):
+    try:
+        return (0, float(str(s).replace(",", "")), "")
+    except ValueError:
+        return (1, 0.0, str(s).lower())
+
+
+class Table(tk.Frame):
+    """Treeview with scrollbar, zebra rows and click-to-sort headings."""
+
+    def __init__(self, parent, cols, height=10, on_double=None, on_select=None):
+        super().__init__(parent, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        self.cols = cols
+        self.keys = [c[0] for c in cols]
+        self.tree = ttk.Treeview(self, columns=self.keys, show="headings", height=height, selectmode="browse")
+        for key, head, w, anc in cols:
+            self.tree.heading(key, text=head, command=lambda k=key: self.sort_by(k))
+            self.tree.column(key, width=w, anchor=anc, stretch=True)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.tree.tag_configure("odd", background="#F8FAFC")
+        self.tree.tag_configure("low", foreground=C["bad"])
+        self.tree.tag_configure("total", background="#E8EDF5", font=FONT_B)
+        self.tree.tag_configure("ok", foreground=C["ok"])
+        self._n, self._vals, self._rev = 0, {}, {}
+        if on_double:
+            self.tree.bind("<Double-1>", lambda e: on_double())
+        if on_select:
+            self.tree.bind("<<TreeviewSelect>>", lambda e: on_select())
+
+    def clear(self):
+        self.tree.delete(*self.tree.get_children())
+        self._n, self._vals = 0, {}
+
+    def add(self, values, iid=None, tags=()):
+        vals = [_fmtv(v) for v in values]
+        iid = str(iid) if iid is not None else "r%d" % self._n
+        if not tags and self._n % 2:
+            tags = ("odd",)
+        self.tree.insert("", "end", iid=iid, values=vals, tags=tags)
+        self._vals[iid] = vals
+        self._n += 1
+        return iid
+
+    def selected(self):
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def select_first(self):
+        kids = self.tree.get_children()
+        if kids:
+            self.tree.selection_set(kids[0])
+            self.tree.focus(kids[0])
+
+    def count(self):
+        return self._n
+
+    def sort_by(self, key):
+        idx = self.keys.index(key)
+        rev = self._rev.get(key, False)
+        items = sorted(self.tree.get_children(""), key=lambda i: _sortkey(self._vals[i][idx]), reverse=rev)
+        for pos, i in enumerate(items):
+            self.tree.move(i, "", pos)
+        self._rev[key] = not rev
+        for pos, i in enumerate(self.tree.get_children("")):
+            t = [x for x in self.tree.item(i, "tags") if x != "odd"]
+            if pos % 2 and not t:
+                t = ["odd"]
+            self.tree.item(i, tags=tuple(t))
+
+
+# =====================================================================================
+#  DIALOGS
+# =====================================================================================
+class FormDialog(Modal):
+    """Generic form.  fields = [{key,label,type(entry|num|int|combo|text|check|password),values,required,full,default}]"""
+
+    def __init__(self, parent, title, fields, initial=None, ok_text="Save", validate=None):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=C["card"])
+        self.resizable(False, False)
+        self.result, self.fields, self.validate, self.w = None, fields, validate, {}
+        init = initial or {}
+        body = tk.Frame(self, bg=C["card"], padx=22, pady=12)
+        body.pack(fill="both", expand=True)
+        ncols = 2 if len(fields) > 5 else 1
+        r = c = 0
+        first = None
+        for f in fields:
+            kind = f.get("type", "entry")
+            span = ncols if (f.get("full") or kind == "text") else 1
+            if c + span > ncols:
+                r += 2
+                c = 0
+            padl = 0 if c == 0 else 14
+            tk.Label(body, text=f["label"] + (" *" if f.get("required") else ""), bg=C["card"], fg=C["mute"],
+                     font=FONT_S).grid(row=r, column=c, columnspan=span, sticky="w", padx=(padl, 0), pady=(8, 0))
+            widget = self._make(body, f, kind, init.get(f["key"], f.get("default", "")))
+            widget.grid(row=r + 1, column=c, columnspan=span, sticky="ew", padx=(padl, 0))
+            c += span
+            if c >= ncols:
+                r += 2
+                c = 0
+            if first is None and kind != "check":
+                first = widget
+        for i in range(ncols):
+            body.grid_columnconfigure(i, weight=1)
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=22, pady=(4, 16))
+        btn(bar, ok_text, self.save, "primary").pack(side="right")
+        btn(bar, "Cancel", self.destroy, "neutral").pack(side="right", padx=8)
+        self.bind("<Return>", self._on_return)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.go_modal(parent)
+        if first is not None:
+            first.focus_set()
+
+    def _make(self, body, f, kind, val):
+        key = f["key"]
+        if kind == "text":
+            t = tk.Text(body, width=44, height=f.get("height", 4), font=FONT, relief="flat", highlightthickness=1,
+                        highlightbackground=C["line"], highlightcolor=C["accent"], wrap="word")
+            t.insert("1.0", plain(val))
+            self.w[key] = ("text", t)
+            return t
+        if kind == "combo":
+            v = tk.StringVar(value=plain(val))
+            cb = ttk.Combobox(body, textvariable=v, values=f.get("values", []),
+                              state="normal" if f.get("editable") else "readonly", width=24)
+            self.w[key] = ("var", v)
+            return cb
+        if kind == "check":
+            v = tk.IntVar(value=1 if to_num(val) else 0)
+            cb = tk.Checkbutton(body, text=f.get("text", ""), variable=v, bg=C["card"], activebackground=C["card"],
+                                font=FONT, anchor="w")
+            self.w[key] = ("var", v)
+            return cb
+        v = tk.StringVar(value=plain(val))
+        e = entry(body, v, width=26, show="*" if kind == "password" else None)
+        if f.get("readonly"):
+            e.config(state="readonly")
+        self.w[key] = ("var", v)
+        return e
+
+    def _on_return(self, e):
+        if not isinstance(e.widget, tk.Text):
+            self.save()
+
+    def save(self, _e=None):
+        data = {}
+        for f in self.fields:
+            k, kind = f["key"], f.get("type", "entry")
+            typ, w = self.w[k]
+            raw = w.get("1.0", "end").strip() if typ == "text" else w.get()
+            if isinstance(raw, str):
+                raw = raw.strip()
+            if f.get("required") and raw == "":
+                messagebox.showwarning("Required", "%s is required" % f["label"], parent=self)
+                return
+            if kind in ("num", "int"):
+                if raw != "" and not re.fullmatch(r"-?[\d,]*\.?\d*", str(raw)):
+                    messagebox.showwarning("Invalid number", "%s: sirf number likhein" % f["label"], parent=self)
+                    return
+                raw = to_num(raw)
+                if kind == "int":
+                    raw = int(raw)
+            elif kind == "check":
+                raw = int(raw)
+            data[k] = raw
+        if self.validate:
+            err = self.validate(data)
+            if err:
+                messagebox.showwarning("Check input", err, parent=self)
+                return
+        self.result = data
+        self.destroy()
+
+
+def ask_form(parent, title, fields, initial=None, ok_text="Save", validate=None):
+    d = FormDialog(parent, title, fields, initial, ok_text, validate)
+    d.wait_window()
+    return d.result
+
+
+class PickDialog(Modal):
+    """Searchable list; fetch(text) -> [(iid, values)]; returns chosen iid (str) or None."""
+
+    def __init__(self, parent, title, cols, fetch, new_cb=None, w=640, h=500):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=C["card"])
+        self.result, self.fetch, self.new_cb = None, fetch, new_cb
+        top = tk.Frame(self, bg=C["card"])
+        top.pack(fill="x", padx=14, pady=(14, 6))
+        self.q = tk.StringVar()
+        self.e = entry(top, self.q, width=40)
+        self.e.pack(side="left", fill="x", expand=True, ipady=4)
+        if new_cb:
+            btn(top, "+ New", self.do_new, "success").pack(side="left", padx=(8, 0))
+        self.tbl = Table(self, cols, height=12, on_double=self.choose)
+        self.tbl.pack(fill="both", expand=True, padx=14, pady=6)
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=14, pady=(0, 14))
+        btn(bar, "Select", self.choose, "primary").pack(side="right")
+        btn(bar, "Cancel", self.destroy, "neutral").pack(side="right", padx=8)
+        self.e.bind("<KeyRelease>", lambda ev: self.load())
+        self.e.bind("<Return>", lambda ev: self.choose())
+        self.e.bind("<Down>", lambda ev: self.tbl.tree.focus_set())
+        self.tbl.tree.bind("<Return>", lambda ev: self.choose())
+        self.bind("<Escape>", lambda ev: self.destroy())
+        self.load()
+        self.go_modal(parent, w, h)
+        self.e.focus_set()
+
+    def load(self):
+        self.tbl.clear()
+        for iid, vals in self.fetch(self.q.get().strip()):
+            self.tbl.add(vals, iid=iid)
+        self.tbl.select_first()
+
+    def choose(self):
+        sel = self.tbl.selected()
+        if sel:
+            self.result = sel
+            self.destroy()
+
+    def do_new(self):
+        nid = self.new_cb(self)
+        if nid:
+            self.result = str(nid)
+            self.destroy()
+
+
+def ask_pick(parent, title, cols, fetch, new_cb=None, w=640, h=500):
+    d = PickDialog(parent, title, cols, fetch, new_cb, w, h)
+    d.wait_window()
+    return d.result
+
+
+# =====================================================================================
+#  SHARED FORMS / ACTIONS
+# =====================================================================================
+def party_form(parent, db, kind, pid=None):
+    table = "customers" if kind == "customer" else "suppliers"
+    init = dict(db.one("SELECT * FROM %s WHERE id=?" % table, (pid,))) if pid else None
+    fields = [{"key": "name", "label": "Name", "required": True, "full": True},
+              {"key": "phone", "label": "Phone / WhatsApp"},
+              {"key": "address", "label": "Address", "full": True},
+              {"key": "opening", "label": "Opening balance (udhar)" if kind == "customer" else "Opening payable", "type": "num"}]
+    res = ask_form(parent, ("Edit " if pid else "New ") + kind.title(), fields, init)
+    return db.save_party(kind, res, pid) if res else None
+
+
+def pick_customer(parent, db, allow_new=True):
+    def fetch(t):
+        rows = []
+        if not t or t.lower() in "walk-in customer":
+            rows.append((WALKIN_ID, ("Walk-in Customer", "", "")))
+        for r in db.parties("customer", t):
+            rows.append((r["id"], (r["name"], r["phone"], r["balance"])))
+        return rows
+    res = ask_pick(parent, "Select Customer", [("name", "Name", 230, "w"), ("phone", "Phone", 130, "w"), ("bal", "Balance", 90, "e")],
+                   fetch, (lambda p: party_form(p, db, "customer")) if allow_new else None)
+    return int(res) if res else None
+
+
+def pick_supplier(parent, db):
+    def fetch(t):
+        return [(r["id"], (r["name"], r["phone"], r["balance"])) for r in db.parties("supplier", t)]
+    res = ask_pick(parent, "Select Supplier", [("name", "Name", 230, "w"), ("phone", "Phone", 130, "w"), ("bal", "Payable", 90, "e")],
+                   fetch, lambda p: party_form(p, db, "supplier"))
+    return int(res) if res else None
+
+
+def product_form(parent, db, pid=None):
+    init = dict(db.one("SELECT * FROM products WHERE id=?", (pid,))) if pid else {"category": "Accessory", "min_stock": 2}
+    fields = [
+        {"key": "name", "label": "Product name", "required": True, "full": True},
+        {"key": "brand", "label": "Brand"},
+        {"key": "category", "label": "Category", "type": "combo", "values": CATEGORIES},
+        {"key": "barcode", "label": "Barcode (scan or type)"},
+        {"key": "warranty_months", "label": "Warranty (months)", "type": "int"},
+        {"key": "cost", "label": "Cost price", "type": "num"},
+        {"key": "price", "label": "Sale price", "type": "num", "required": True},
+        {"key": "stock", "label": "Stock (non-IMEI items)", "type": "num"},
+        {"key": "min_stock", "label": "Low-stock alert at", "type": "num"},
+        {"key": "track_imei", "label": "IMEI / Serial", "type": "check", "text": "Track every unit by IMEI (mobiles)", "full": True},
+    ]
+
+    def validate(d):
+        if db.barcode_taken(d["barcode"], pid):
+            return "Ye barcode kisi aur product ka hai."
+        return None
+    res = ask_form(parent, "Edit Product" if pid else "New Product", fields, init, validate=validate)
+    return db.save_product(res, pid) if res else None
+
+
+def warranty_lookup(parent, db):
+    res = ask_form(parent, "Warranty / IMEI Lookup", [{"key": "imei", "label": "IMEI / Serial number", "required": True}], ok_text="Check")
+    if not res:
+        return
+    info = db.imei_lookup(res["imei"])
+    if not info:
+        messagebox.showinfo("Not found", "Ye IMEI / serial system me nahi mila.", parent=parent)
+        return
+    st = {"in_stock": "In stock (not sold yet)", "sold": "Sold"}.get(info["status"], info["status"])
+    lines = ["Product: %s %s" % (info["pbrand"], info["pname"]), "IMEI: %s" % info["imei"], "Status: %s" % st]
+    if info["sale_id"]:
+        lines += ["Invoice: %s" % info["invoice"], "Sold on: %s" % info["sold_on"][:16],
+                  "Customer: %s  %s" % (info["customer"], info["phone"] or "")]
+        if info["wm"]:
+            lines.append("Warranty: %d month(s) - till %s  ->  %s" % (info["wm"], info["warranty_until"],
+                                                                     "ACTIVE" if info["warranty_active"] else "EXPIRED"))
+        else:
+            lines.append("Warranty: none on this invoice")
+    messagebox.showinfo("IMEI details", "\n".join(lines), parent=parent)
+
+
+def act_print_invoice(parent, db, sale_id):
+    sale, items = db.get_sale(sale_id)
+    path = INVOICE_DIR / ("%s.html" % sale["invoice_no"])
+    path.write_text(invoice_html(sale, items, db.settings()), encoding="utf-8")
+    open_html(path)
+
+
+def act_pdf_invoice(parent, db, sale_id):
+    sale, items = db.get_sale(sale_id)
+    path = INVOICE_DIR / ("%s.pdf" % sale["invoice_no"])
+    try:
+        invoice_pdf(sale, items, db.settings(), path)
+    except ImportError:
+        messagebox.showinfo("PDF", "PDF ke liye 'reportlab' install karein:\nThonny > Tools > Manage packages > reportlab\n\n"
+                                   "Abhi Print button use karein - browser me 'Save as PDF' select kar lein.", parent=parent)
+        return
+    open_path(path)
+
+
+def act_whatsapp_invoice(parent, db, sale_id):
+    sale, items = db.get_sale(sale_id)
+    cfg = db.settings()
+    phone = sale["customer_phone"] or ""
+    if not re.sub(r"\D", "", phone):
+        res = ask_form(parent, "Send on WhatsApp", [{"key": "phone", "label": "Customer WhatsApp number", "required": True}],
+                       ok_text="Open WhatsApp")
+        if not res:
+            return
+        phone = res["phone"]
+    webbrowser.open(wa_link(phone, receipt_text(sale, items, cfg), cfg.get("country_code", "92")))
+
+
+def act_whatsapp_text(parent, db, phone, text):
+    cfg = db.settings()
+    if not re.sub(r"\D", "", phone or ""):
+        res = ask_form(parent, "Send on WhatsApp", [{"key": "phone", "label": "WhatsApp number", "required": True}], ok_text="Open WhatsApp")
+        if not res:
+            return
+        phone = res["phone"]
+    webbrowser.open(wa_link(phone, text, cfg.get("country_code", "92")))
+
+
+def export_csv(parent, headers, rows, name="export"):
+    path = filedialog.asksaveasfilename(parent=parent, defaultextension=".csv", initialfile="%s_%s.csv" % (name, today_str()),
+                                        filetypes=[("CSV file", "*.csv")])
+    if not path:
+        return
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
+    messagebox.showinfo("Exported", "Saved:\n%s" % path, parent=parent)
+
+
+def print_table(db, title, headers, rows, subtitle=""):
+    path = INVOICE_DIR / ("report_%s.html" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    path.write_text(table_html(title, headers, rows, db.settings(), subtitle), encoding="utf-8")
+    open_html(path)
+
+
+# =====================================================================================
+#  PAGE BASE + INVOICE DIALOG + IMEI DIALOG
+# =====================================================================================
+class Page(tk.Frame):
+    def __init__(self, app):
+        super().__init__(app.content, bg=C["bg"])
+        self.app, self.db = app, app.db
+        self.build()
+
+    def build(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def hotkey(self, key):
+        pass
+
+    def cur(self):
+        return self.db.get_setting("currency", "Rs")
+
+    def header(self, title, sub=""):
+        f = tk.Frame(self, bg=C["bg"])
+        f.pack(fill="x", padx=16, pady=(12, 6))
+        tk.Label(f, text=title, font=FONT_H, bg=C["bg"], fg=C["text"]).pack(side="left")
+        if sub:
+            tk.Label(f, text=sub, font=FONT_S, bg=C["bg"], fg=C["mute"]).pack(side="left", padx=10, pady=(8, 0))
+        right = tk.Frame(f, bg=C["bg"])
+        right.pack(side="right")
+        return right
+
+
+class InvoiceDialog(Modal):
+    def __init__(self, parent, app, sale_id, done=False):
+        super().__init__(parent)
+        self.app, self.db, self.sale_id, self.done = app, app.db, sale_id, done
+        self.title("Invoice")
+        self.configure(bg=C["card"])
+        self.head = tk.Label(self, bg=C["ok"] if done else C["accent"], fg="white", font=("Segoe UI", 13, "bold"),
+                             anchor="w", padx=16, pady=10)
+        self.head.pack(fill="x")
+        self.info = tk.Label(self, bg=C["card"], fg=C["text"], font=FONT, justify="left", anchor="w", padx=16, pady=8)
+        self.info.pack(fill="x")
+        self.tbl = Table(self, [("name", "Item", 220, "w"), ("imei", "IMEI / Serial", 130, "w"), ("qty", "Qty", 45, "e"),
+                                ("ret", "Returned", 65, "e"), ("price", "Price", 75, "e"), ("disc", "Disc %", 55, "e"),
+                                ("total", "Total", 85, "e")], height=7)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=4)
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=16, pady=(6, 14))
+        btn(bar, "Print", lambda: act_print_invoice(self, self.db, sale_id), "primary").pack(side="left")
+        btn(bar, "PDF", lambda: act_pdf_invoice(self, self.db, sale_id), "neutral").pack(side="left", padx=6)
+        btn(bar, "WhatsApp", lambda: act_whatsapp_invoice(self, self.db, sale_id), "success").pack(side="left")
+        btn(bar, "Return Item", self.return_item, "warn").pack(side="left", padx=6)
+        btn(bar, "Close", self.destroy, "neutral").pack(side="right")
+        self.bind("<Escape>", lambda e: self.destroy())
+        if done:
+            self.bind("<Return>", lambda e: act_print_invoice(self, self.db, sale_id))
+        self.load()
+        self.go_modal(parent, 780, 480)
+
+    def load(self):
+        sale, items = self.db.get_sale(self.sale_id)
+        cur = self.db.get_setting("currency", "Rs")
+        self.head.config(text=("Sale completed   |   " if self.done else "") + sale["invoice_no"])
+        self.info.config(text="Customer: %s     Date: %s\nTotal: %s %s     Paid: %s     Due: %s     Method: %s" % (
+            sale["customer_name"], sale["date"][:16], cur, fmt(sale["total"]), fmt(sale["paid"]), fmt(sale["balance_due"]), sale["method"]))
+        self.tbl.clear()
+        for it in items:
+            self.tbl.add([it["name"], it["imei"], it["qty"], it["returned_qty"] or "", it["price"], it["disc_pct"] or "",
+                          it["line_total"]], iid=it["id"])
+
+    def return_item(self):
+        iid = self.tbl.selected()
+        if not iid:
+            messagebox.showinfo("Return", "Pehle item select karein.", parent=self)
+            return
+        it = self.db.one("SELECT * FROM sale_items WHERE id=?", (int(iid),))
+        left = it["qty"] - it["returned_qty"]
+        if left <= 0:
+            messagebox.showinfo("Return", "Ye item pehle hi return ho chuka hai.", parent=self)
+            return
+        res = ask_form(self, "Return Item", [{"key": "qty", "label": "Return quantity (max %s)" % fmt(left), "type": "num", "default": left},
+                                             {"key": "note", "label": "Reason", "full": True}])
+        if not res:
+            return
+        try:
+            refund, adj, cash = self.db.return_items(self.sale_id, [(it["id"], res["qty"])], self.app.user["id"], res["note"])
+        except ValueError as e:
+            messagebox.showerror("Return", str(e), parent=self)
+            return
+        messagebox.showinfo("Return done", "Refund total: %s\nUdhar me adjust: %s\nCash wapas dena hai: %s" % (fmt(refund), fmt(adj), fmt(cash)),
+                            parent=self)
+        self.load()
+
+
+class IMEIDialog(Modal):
+    def __init__(self, parent, app, pid):
+        super().__init__(parent)
+        self.app, self.db, self.pid = app, app.db, pid
+        p = self.db.one("SELECT * FROM products WHERE id=?", (pid,))
+        self.p = p
+        self.title("IMEI / Serial stock")
+        self.configure(bg=C["card"])
+        tk.Label(self, text=p["name"], bg=C["card"], font=("Segoe UI", 13, "bold"), anchor="w", padx=16, pady=10).pack(fill="x")
+        top = tk.Frame(self, bg=C["card"])
+        top.pack(fill="x", padx=16)
+        self.status = tk.StringVar(value="In Stock")
+        cb = ttk.Combobox(top, textvariable=self.status, values=["In Stock", "Sold", "All"], state="readonly", width=10)
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.load())
+        self.q = tk.StringVar()
+        e = entry(top, self.q, width=28)
+        e.pack(side="left", padx=8, ipady=3)
+        e.bind("<KeyRelease>", lambda ev: self.load())
+        self.lbl = tk.Label(top, bg=C["card"], fg=C["mute"], font=FONT_S)
+        self.lbl.pack(side="right")
+        self.tbl = Table(self, [("imei", "IMEI / Serial", 170, "w"), ("note", "Color / Note", 150, "w"), ("cost", "Cost", 80, "e"),
+                                ("st", "Status", 80, "w"), ("inv", "Sold on invoice", 120, "w")], height=12)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=8)
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=16, pady=(0, 14))
+        btn(bar, "Add IMEIs", self.add, "success").pack(side="left")
+        btn(bar, "Remove (in stock)", self.remove, "danger").pack(side="left", padx=6)
+        btn(bar, "Close", self.destroy, "neutral").pack(side="right")
+        self.bind("<Escape>", lambda ev: self.destroy())
+        self.load()
+        self.go_modal(parent, 700, 520)
+
+    def load(self):
+        sql = "SELECT u.*, s.invoice_no FROM imei_units u LEFT JOIN sales s ON s.id=u.sale_id WHERE u.product_id=?"
+        args = [self.pid]
+        st = self.status.get()
+        if st == "In Stock":
+            sql += " AND u.status='in_stock'"
+        elif st == "Sold":
+            sql += " AND u.status='sold'"
+        if self.q.get().strip():
+            sql += " AND u.imei LIKE ?"
+            args.append("%" + self.q.get().strip() + "%")
+        self.tbl.clear()
+        rows = self.db.q(sql + " ORDER BY u.id DESC", args)
+        for r in rows:
+            self.tbl.add([r["imei"], r["note"], r["cost"], "In stock" if r["status"] == "in_stock" else "Sold", r["invoice_no"] or ""], iid=r["id"])
+        self.lbl.config(text="%d unit(s)" % len(rows))
+
+    def add(self):
+        res = ask_form(self, "Add IMEIs", [
+            {"key": "cost", "label": "Cost per unit", "type": "num", "default": self.p["cost"]},
+            {"key": "note", "label": "Color / Storage / Note"},
+            {"key": "imeis", "label": "IMEI / Serial numbers (one per line, or scan)", "type": "text", "height": 8}])
+        if not res:
+            return
+        valid, bad = parse_imeis(res["imeis"])
+        added, dup = self.db.add_imeis(self.pid, valid, res["cost"], res["note"])
+        msg = "%d IMEI added." % added
+        if dup:
+            msg += "\nAlready exist (skipped): %s" % ", ".join(dup[:6])
+        if bad:
+            msg += "\nInvalid (6-20 letters/digits): %s" % ", ".join(bad[:6])
+        messagebox.showinfo("IMEI", msg, parent=self)
+        self.load()
+
+    def remove(self):
+        iid = self.tbl.selected()
+        if not iid:
+            return
+        u = self.db.one("SELECT * FROM imei_units WHERE id=?", (int(iid),))
+        if u["status"] != "in_stock":
+            messagebox.showinfo("Remove", "Sold unit delete nahi ho sakta.", parent=self)
+            return
+        if messagebox.askyesno("Remove", "IMEI %s delete karein?" % u["imei"], parent=self):
+            self.db.x("DELETE FROM imei_units WHERE id=?", (u["id"],))
+            self.db.refresh_stock(self.pid)
+            self.load()
+# =====================================================================================
+#  ANIMATION HELPERS  (used by login screen, hover buttons, dashboard counters)
+# =====================================================================================
+def ease_out(t):
+    return 1 - (1 - t) ** 3
+
+
+def animate(root, duration_ms, on_step, on_done=None, fps=60):
+    """Drives on_step(t) with t easing 0->1 over duration_ms. Safe if widgets get destroyed mid-flight."""
+    steps = max(1, int(duration_ms / 1000.0 * fps))
+    delay = max(1, int(duration_ms / steps))
+    state = {"i": 0}
+
+    def tick():
+        state["i"] += 1
+        t = min(1.0, state["i"] / steps)
+        try:
+            on_step(ease_out(t))
+        except tk.TclError:
+            return
+        if t < 1.0:
+            try:
+                root.after(delay, tick)
+            except tk.TclError:
+                pass
+        elif on_done:
+            on_done()
+    tick()
+
+
+def flash_border(widget, bad, good, times=3, delay=90):
+    seq = []
+    for _ in range(times):
+        seq += [bad, good]
+
+    def step():
+        if not seq:
+            return
+        c = seq.pop(0)
+        try:
+            widget.config(highlightbackground=c, highlightcolor=c)
+            widget.after(delay, step)
+        except tk.TclError:
+            pass
+    step()
+
+
+ROLE_LEVEL = {"cashier": 1, "manager": 2, "admin": 3}
+
+
+def monogram(parent, size=64, color=None, text=None, bg=None):
+    """Small branded circle badge with initials, e.g. for the login screen / sidebar header."""
+    color = color or C["accent"]
+    bg = bg if bg is not None else parent.cget("bg")
+    cv = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0)
+    pad = max(1, size // 32)
+    cv.create_oval(pad, pad, size - pad, size - pad, fill=color, outline="")
+    cv.create_text(size / 2, size / 2, text=text or APP_INITIALS, fill="white",
+                   font=("Segoe UI", max(8, int(size * 0.34)), "bold"))
+    return cv
+
+
+# =====================================================================================
+#  LICENSE ACTIVATION (shared: called from login screen, license gate, settings page)
+# =====================================================================================
+def open_activation(parent, db):
+    mid = machine_id()
+    res = ask_form(parent, "Activate License", [
+        {"key": "mid", "label": "Machine ID (vendor ko yeh bhejein)", "default": mid, "readonly": True, "full": True},
+        {"key": "key", "label": "License Key", "required": True, "full": True},
+    ], ok_text="Activate")
+    if not res:
+        return False
+    ok, msg = activate_license(db, res["key"])
+    if ok:
+        messagebox.showinfo("License", "License activate ho gaya. Shukriya!", parent=parent)
+    else:
+        messagebox.showerror("License", msg, parent=parent)
+    return ok
+
+
+# =====================================================================================
+#  ANIMATED LOGIN SCREEN
+# =====================================================================================
+class LoginScreen(tk.Frame):
+    def __init__(self, app, on_success):
+        super().__init__(app, bg=C["side"])
+        self.app, self.db, self.on_success = app, app.db, on_success
+        try:
+            self.app.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.place(x=0, y=0, relwidth=1, relheight=1)
+
+        tk.Frame(self, bg=C["accent"], width=6).place(x=0, y=0, relheight=1)
+
+        self.card = tk.Frame(self, bg=C["card"], padx=36, pady=28, highlightthickness=2,
+                              highlightbackground=C["line"], highlightcolor=C["line"])
+        self.card.place(relx=0.5, rely=1.15, anchor="center")
+
+        monogram(self.card, size=60).pack(pady=(0, 4))
+        tk.Label(self.card, text=APP_NAME, font=("Segoe UI", 18, "bold"), bg=C["card"], fg=C["text"]).pack()
+        tk.Label(self.card, text="v%s" % APP_VERSION, font=FONT_S, bg=C["card"], fg=C["mute"]).pack(pady=(0, 16))
+
+        self.uvar, self.pvar = tk.StringVar(), tk.StringVar()
+        tk.Label(self.card, text="Username", font=FONT_S, bg=C["card"], fg=C["mute"], anchor="w").pack(fill="x")
+        eu = entry(self.card, self.uvar, width=26)
+        eu.pack(fill="x", pady=(2, 10), ipady=5)
+        tk.Label(self.card, text="Password", font=FONT_S, bg=C["card"], fg=C["mute"], anchor="w").pack(fill="x")
+        ep = entry(self.card, self.pvar, width=26, show="*")
+        ep.pack(fill="x", pady=(2, 4), ipady=5)
+
+        self.status = tk.Label(self.card, text=" ", font=FONT_S, bg=C["card"], fg=C["bad"])
+        self.status.pack(fill="x", pady=(2, 10))
+
+        btn(self.card, "Login", self.try_login, "primary").pack(fill="x", ipady=4)
+
+        bottom = tk.Frame(self.card, bg=C["card"])
+        bottom.pack(fill="x", pady=(14, 0))
+        self.lic_lbl = tk.Label(bottom, text="", font=FONT_S, bg=C["card"], fg=C["mute"])
+        self.lic_lbl.pack(side="left")
+        act = tk.Label(bottom, text="Activate License", font=FONT_S, bg=C["card"], fg=C["accent"], cursor="hand2")
+        act.pack(side="right")
+        act.bind("<Button-1>", lambda e: (open_activation(self.app, self.db), self._refresh_license_label()))
+
+        eu.bind("<Return>", lambda e: ep.focus_set())
+        ep.bind("<Return>", lambda e: self.try_login())
+        self.after(30, self._animate_in)
+        self._refresh_license_label()
+        eu.focus_set()
+
+    def _refresh_license_label(self):
+        st = license_status(self.db)
+        color = {"licensed": C["ok"], "trial": C["warn"], "expired": C["bad"], "tampered": C["bad"]}.get(st["state"], C["mute"])
+        try:
+            self.lic_lbl.config(text=st["text"], fg=color)
+        except tk.TclError:
+            pass
+
+    def _animate_in(self):
+        def step(t):
+            self.app.attributes("-alpha", t)
+            self.card.place(relx=0.5, rely=1.15 - 0.70 * t, anchor="center")
+        animate(self.app, 260, step)
+
+    def try_login(self):
+        u = self.db.check_login(self.uvar.get().strip(), self.pvar.get())
+        if not u:
+            self.status.config(text="Galat username ya password")
+            flash_border(self.card, C["bad"], C["line"])
+            self.pvar.set("")
+            return
+        self.destroy()
+        self.on_success(u)
+
+
+# =====================================================================================
+#  LICENSE GATE  (shown instead of the app when trial expired / date tampered)
+# =====================================================================================
+class LicenseGateScreen(tk.Frame):
+    def __init__(self, app, st, on_retry):
+        super().__init__(app, bg=C["side"])
+        self.app, self.db, self.on_retry = app, app.db, on_retry
+        self.place(x=0, y=0, relwidth=1, relheight=1)
+        card = tk.Frame(self, bg=C["card"], padx=34, pady=26, highlightthickness=2, highlightbackground=C["bad"])
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(card, text="\U0001F512", font=("Segoe UI Emoji", 30), bg=C["card"]).pack()
+        tk.Label(card, text=st["text"], font=("Segoe UI", 13, "bold"), bg=C["card"], fg=C["bad"],
+                 wraplength=340, justify="center").pack(pady=(6, 12))
+        tk.Label(card, text="Is software ko dobara use karne ke liye license activate karein.",
+                 font=FONT_S, bg=C["card"], fg=C["mute"], wraplength=340, justify="center").pack(pady=(0, 14))
+        btn(card, "Activate License", self._activate, "primary").pack(fill="x", ipady=3)
+        btn(card, "Contact Vendor on WhatsApp", self._contact, "success").pack(fill="x", pady=8, ipady=3)
+        btn(card, "Logout", self._logout, "neutral").pack(fill="x")
+
+    def _activate(self):
+        open_activation(self.app, self.db)
+        self.on_retry()
+
+    def _contact(self):
+        msg = "Assalam-o-Alaikum, mujhe %s ke liye license chahiye.\nMachine ID: %s" % (APP_NAME, machine_id())
+        webbrowser.open(wa_link(VENDOR_PHONE, msg))
+
+    def _logout(self):
+        self.app.user = None
+        self.app.show_login()
+
+
+# =====================================================================================
+#  MAIN APP SHELL
+# =====================================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        init_dirs()
+        self.db = DB(DB_PATH)
+        self.user = None
+        self.current_key = None
+        self.nav_btns = {}
+        self._clock_after_id = None
+        setup_style(self)
+        self.title(APP_NAME)
+        self.geometry("1220x760")
+        self.minsize(1024, 640)
+        self.configure(bg=C["bg"])
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.report_callback_exception = self._on_tk_error
+        self.show_login()
+
+    def _on_tk_error(self, exc, val, tb):
+        traceback.print_exception(exc, val, tb)
+        try:
+            messagebox.showerror("Error", "Kuch ghalat ho gaya:\n%s" % val)
+        except Exception:
+            pass
+
+    # ---- login / license flow ----
+    def show_login(self):
+        for w in self.winfo_children():
+            w.destroy()
+        try:
+            self.attributes("-alpha", 1.0)
+        except tk.TclError:
+            pass
+        LoginScreen(self, self.on_login_success)
+
+    def on_login_success(self, user):
+        self.user = dict(user)
+        if self.user.get("must_change"):
+            self.force_password_change(first_time=True)
+            if self.user is None:
+                return
+        st = license_status(self.db)
+        if st["state"] in ("expired", "tampered"):
+            self.show_license_gate(st)
+            return
+        self.build_shell()
+        self._maybe_daily_backup()
+        if st["state"] == "trial" and st["days"] <= 3:
+            self.after(400, lambda: messagebox.showwarning(
+                "Trial", "Trial sirf %d din baaki hai. Jald activate karein." % st["days"], parent=self))
+
+    def show_license_gate(self, st):
+        for w in self.winfo_children():
+            w.destroy()
+        LicenseGateScreen(self, st, lambda: self.on_login_success(self.user))
+
+    def force_password_change(self, first_time=False):
+        while True:
+            res = ask_form(self, "Password Change Zaroori" if first_time else "Change Password",
+                            [{"key": "p1", "label": "New password", "type": "password", "required": True},
+                             {"key": "p2", "label": "Confirm password", "type": "password", "required": True}],
+                            ok_text="Change")
+            if res is None:
+                if not first_time:
+                    return
+                if messagebox.askyesno("Cancel", "Password change zaroori hai.\nLogout karein?", parent=self):
+                    self.user = None
+                    self.show_login()
+                    return
+                continue
+            if len(res["p1"]) < 4:
+                messagebox.showwarning("Weak password", "Kam se kam 4 characters ka password rakhein.", parent=self)
+                continue
+            if res["p1"] != res["p2"]:
+                messagebox.showwarning("Mismatch", "Dono password same nahi hain.", parent=self)
+                continue
+            self.db.set_password(self.user["id"], res["p1"], must_change=0)
+            self.user["must_change"] = 0
+            messagebox.showinfo("Done", "Password change ho gaya.", parent=self)
+            return
+
+    def _maybe_daily_backup(self):
+        try:
+            today = today_str()
+            done = any(today in f.name for f in BACKUP_DIR.glob("backup_*_daily.db"))
+            if not done:
+                self.after(600, lambda: backup_db(self.db, tag="daily"))
+        except Exception:
+            pass
+
+    # ---- shell ----
+    def build_shell(self):
+        for w in self.winfo_children():
+            w.destroy()
+        try:
+            if self._clock_after_id is not None:
+                self.after_cancel(self._clock_after_id)
+        except tk.TclError:
+            pass
+        self._clock_after_id = None
+        root = tk.Frame(self, bg=C["bg"])
+        root.pack(fill="both", expand=True)
+        self.sidebar = tk.Frame(root, bg=C["side"], width=215)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        self.content = tk.Frame(root, bg=C["bg"])
+        self.content.pack(side="left", fill="both", expand=True)
+
+        head = tk.Frame(self.sidebar, bg=C["side"], padx=16, pady=14)
+        head.pack(fill="x")
+        monogram(head, size=38, bg=C["side"]).pack(side="left")
+        tk.Label(head, text=APP_NAME, font=("Segoe UI", 13, "bold"), bg=C["side"], fg="white",
+                anchor="w", wraplength=140, justify="left").pack(side="left", padx=(10, 0))
+
+        self.nav_area = tk.Frame(self.sidebar, bg=C["side"])
+        self.nav_area.pack(fill="x")
+        self.nav_btns = {}
+        lvl = ROLE_LEVEL.get(self.user["role"], 1)
+        for item in NAV_ITEMS:
+            if lvl < item["min_role"]:
+                continue
+            b = tk.Label(self.nav_area, text="  %s  %s" % (item.get("icon", ""), item["label"]), font=FONT, bg=C["side"], fg="#CBD5E1",
+                         anchor="w", padx=14, pady=10, cursor="hand2")
+            b.pack(fill="x")
+            b.bind("<Button-1>", lambda e, k=item["key"]: self.show_page(k))
+            b.bind("<Enter>", lambda e, w=b, k=item["key"]: (w.config(bg=C["side2"]) if k != self.current_key else None))
+            b.bind("<Leave>", lambda e, w=b, k=item["key"]: (w.config(bg=C["side"]) if k != self.current_key else None))
+            self.nav_btns[item["key"]] = b
+            if item.get("hotkey"):
+                self.bind_all("<%s>" % item["hotkey"], lambda e, k=item["key"]: self.show_page(k))
+
+        tk.Frame(self.sidebar, bg=C["side2"], height=1).pack(fill="x", pady=8)
+        info = tk.Frame(self.sidebar, bg=C["side"])
+        info.pack(fill="x", side="bottom", pady=10, padx=12)
+        self.lic_lbl = tk.Label(info, text="", font=FONT_S, bg=C["side"], anchor="w")
+        self.lic_lbl.pack(fill="x")
+        tk.Label(info, text=self.user.get("full_name") or self.user["username"], font=FONT_B, bg=C["side"],
+                 fg="white", anchor="w").pack(fill="x", pady=(6, 0))
+        tk.Label(info, text=self.user["role"].title(), font=FONT_S, bg=C["side"], fg="#94A3B8", anchor="w").pack(fill="x")
+        rowb = tk.Frame(info, bg=C["side"])
+        rowb.pack(fill="x", pady=(8, 0))
+        btn(rowb, "Password", self.force_password_change, "neutral", small=True).pack(side="left")
+        btn(rowb, "Logout", self.do_logout, "danger", small=True).pack(side="left", padx=6)
+        self.clock_lbl = tk.Label(info, text="", font=FONT_S, bg=C["side"], fg="#64748B", anchor="w")
+        self.clock_lbl.pack(fill="x", pady=(10, 0))
+        self._tick_clock()
+
+        self._refresh_license_label()
+        self.show_page(NAV_ITEMS[0]["key"])
+
+    def _tick_clock(self):
+        try:
+            self.clock_lbl.config(text=datetime.now().strftime("%I:%M %p  -  %d %b %Y"))
+            self._clock_after_id = self.after(1000, self._tick_clock)
+        except tk.TclError:
+            self._clock_after_id = None
+
+    def _refresh_license_label(self):
+        st = license_status(self.db)
+        color = {"licensed": C["ok"], "trial": C["warn"], "expired": C["bad"], "tampered": C["bad"]}.get(st["state"], "#94A3B8")
+        try:
+            self.lic_lbl.config(text=st["text"], fg=color)
+        except tk.TclError:
+            pass
+
+    def show_page(self, key):
+        cls = PAGE_CLASSES.get(key)
+        if cls is None:
+            return None
+        for k, b in self.nav_btns.items():
+            b.config(bg=C["accent"] if k == key else C["side"], fg="white" if k == key else "#CBD5E1")
+        self.current_key = key
+        for w in self.content.winfo_children():
+            w.destroy()
+        page = cls(self)
+        page.pack(fill="both", expand=True)
+        page.refresh()
+        return page
+
+    def do_logout(self):
+        self.user = None
+        self.current_key = None
+        self.show_login()
+
+    def on_close(self):
+        try:
+            backup_db(self.db, tag="exit")
+        except Exception:
+            pass
+        self.destroy()
+
+
+# =====================================================================================
+#  DASHBOARD PAGE
+# =====================================================================================
+class DashboardPage(Page):
+    COUNT_KEYS = {"low_stock", "repairs"}
+
+    def build(self):
+        name = self.app.user.get("full_name") or self.app.user["username"]
+        greet = "Assalam-o-Alaikum, %s!  Aaj %s" % (name, datetime.now().strftime("%d %B %Y"))
+        self.header("Dashboard", greet)
+        wrap = tk.Frame(self, bg=C["bg"])
+        wrap.pack(fill="both", expand=True, padx=16)
+
+        self.cards_frame = tk.Frame(wrap, bg=C["bg"])
+        self.cards_frame.pack(fill="x")
+        self.cards = {}
+        specs = [
+            ("today", "Aaj ki Sale", C["accent"], "sales"),
+            ("month_profit", "Is Mahine Profit", C["ok"], "reports"),
+            ("receivable", "Wasooli (Udhar milna)", C["warn"], "customers"),
+            ("payable", "Dena (Udhar dena)", C["bad"], "suppliers"),
+            ("low_stock", "Low Stock Items", C["bad"], "products"),
+            ("repairs", "Pending Repairs", C["accent"], "repairs"),
+        ]
+        for i, (key, label, color, target) in enumerate(specs):
+            card = tk.Frame(self.cards_frame, bg=C["card"], highlightthickness=1, highlightbackground=C["line"],
+                            padx=16, pady=14, cursor="hand2")
+            card.grid(row=i // 3, column=i % 3, sticky="nsew", padx=6, pady=6)
+            self.cards_frame.grid_columnconfigure(i % 3, weight=1)
+            lbl1 = tk.Label(card, text=label, font=FONT_S, bg=C["card"], fg=C["mute"], anchor="w", cursor="hand2")
+            lbl1.pack(fill="x")
+            val = tk.Label(card, text="0", font=("Segoe UI", 22, "bold"), bg=C["card"], fg=color, anchor="w", cursor="hand2")
+            val.pack(fill="x", pady=(4, 0))
+            self.cards[key] = val
+            hover_bg = lerp_color(C["card"], color, 0.07)
+            for w in (card, lbl1, val):
+                w.bind("<Button-1>", lambda e, k=target: self.app.show_page(k))
+                w.bind("<Enter>", lambda e, c=card, l=lbl1, v=val, hc=hover_bg: (c.config(bg=hc), l.config(bg=hc), v.config(bg=hc)))
+                w.bind("<Leave>", lambda e, c=card, l=lbl1, v=val: (c.config(bg=C["card"]), l.config(bg=C["card"]), v.config(bg=C["card"])))
+
+        chart_card = tk.Frame(wrap, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], padx=16, pady=12)
+        chart_card.pack(fill="x", pady=(8, 0))
+        tk.Label(chart_card, text="Last 7 Days - Sales", font=FONT_B, bg=C["card"], fg=C["text"], anchor="w").pack(fill="x")
+        self.chart = tk.Canvas(chart_card, height=110, bg=C["card"], highlightthickness=0)
+        self.chart.pack(fill="x", pady=(8, 0))
+        self.chart.bind("<Configure>", lambda e: self._draw_chart())
+        self._chart_data = []
+
+        tk.Label(chart_card, text="Payment Methods (Aaj)", font=FONT_B, bg=C["card"], fg=C["text"], anchor="w")\
+            .pack(fill="x", pady=(14, 0))
+        self.pm_canvas = tk.Canvas(chart_card, height=22, bg=C["card"], highlightthickness=0)
+        self.pm_canvas.pack(fill="x", pady=(6, 0))
+        self.pm_canvas.bind("<Configure>", lambda e: self._draw_payment_bar())
+        self.pm_legend = tk.Frame(chart_card, bg=C["card"])
+        self.pm_legend.pack(fill="x", pady=(6, 0))
+        self._pm_data = []
+
+        row2 = tk.Frame(wrap, bg=C["bg"])
+        row2.pack(fill="both", expand=True, pady=(10, 12))
+        left = tk.Frame(row2, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        tk.Label(left, text="Low Stock", font=FONT_B, bg=C["card"], fg=C["text"], anchor="w", padx=12, pady=8).pack(fill="x")
+        self.low_tbl = Table(left, [("name", "Product", 160, "w"), ("stock", "Stock", 60, "e"), ("min", "Min", 60, "e")],
+                             height=8, on_double=self._open_low_item)
+        self.low_tbl.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        right = tk.Frame(row2, bg=C["card"], highlightthickness=1, highlightbackground=C["line"])
+        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        tk.Label(right, text="Recent Sales", font=FONT_B, bg=C["card"], fg=C["text"], anchor="w", padx=12, pady=8).pack(fill="x")
+        self.recent_tbl = Table(right, [("inv", "Invoice", 100, "w"), ("cust", "Customer", 120, "w"), ("total", "Total", 80, "e")],
+                                height=8, on_double=self._open_sale)
+        self.recent_tbl.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        qa = tk.Frame(wrap, bg=C["bg"])
+        qa.pack(fill="x", pady=(0, 10))
+        btn(qa, "+ New Sale", lambda: self.app.show_page("pos"), "primary").pack(side="left")
+        btn(qa, "+ Purchase", lambda: self.app.show_page("purchases"), "neutral").pack(side="left", padx=6)
+        btn(qa, "+ Repair Job", lambda: self.app.show_page("repairs"), "neutral").pack(side="left")
+        btn(qa, "+ Product", lambda: self.app.show_page("products"), "neutral").pack(side="left", padx=6)
+
+    def refresh(self):
+        db = self.db
+        today = today_str()
+        month_start = today[:8] + "01"
+        s_today = db.summary(today, today)
+        s_month = db.summary(month_start, today)
+        targets = {
+            "today": s_today["gross_sales"],
+            "month_profit": s_month["net_profit"],
+            "receivable": db.receivable(),
+            "payable": db.payable(),
+            "low_stock": len(db.low_stock()),
+            "repairs": db.pending_repairs(),
+        }
+        for key, tgt in targets.items():
+            self._count_up(self.cards[key], to_num(tgt), integer=(key in self.COUNT_KEYS))
+        self.low_tbl.clear()
+        for p in db.low_stock()[:30]:
+            self.low_tbl.add([p["name"], p["stock"], p["min_stock"]], iid=p["id"], tags=("low",))
+        self.recent_tbl.clear()
+        for r in db.q("SELECT s.id, s.invoice_no, s.total, c.name cn FROM sales s LEFT JOIN customers c ON c.id=s.customer_id "
+                      "ORDER BY s.id DESC LIMIT 10"):
+            self.recent_tbl.add([r["invoice_no"], r["cn"], r["total"]], iid=r["id"])
+
+        days = []
+        for i in range(6, -1, -1):
+            d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+            s = db.summary(d, d)
+            days.append((d[5:], s["gross_sales"]))
+        self._chart_data = days
+        self.after(50, lambda: self._draw_chart(animate_in=True))
+
+        self._pm_data = [(r["method"], r["amt"]) for r in db.q(
+            "SELECT method, SUM(total) amt FROM sales WHERE substr(date,1,10)=? GROUP BY method ORDER BY amt DESC", (today,))]
+        self.after(50, self._draw_payment_bar)
+
+    def _count_up(self, label, target, integer=False):
+        def step(t):
+            v = target * t
+            text = str(int(round(v))) if integer else fmt(v)
+            try:
+                label.config(text=text)
+            except tk.TclError:
+                pass
+        animate(self.app, 450, step)
+
+    def _draw_chart(self, animate_in=False):
+        c = self.chart
+        data = self._chart_data
+        try:
+            w = c.winfo_width()
+            h = int(c.cget("height"))
+        except tk.TclError:
+            return
+        if w < 20:
+            return
+        c.delete("all")
+        if not data:
+            return
+        maxv = max((v for _, v in data), default=0) or 1
+        n = len(data)
+        gap = 10
+        bw = max(18, (w - gap * (n + 1)) / n)
+
+        def draw(t):
+            try:
+                c.delete("bar")
+                for i, (lbl, val) in enumerate(data):
+                    x0 = gap + i * (bw + gap)
+                    bh = (val / maxv) * (h - 30) * t
+                    y0 = h - 20 - bh
+                    c.create_rectangle(x0, y0, x0 + bw, h - 20, fill=C["accent"], width=0, tags="bar")
+                    c.create_text(x0 + bw / 2, h - 10, text=lbl, fill=C["mute"], font=FONT_S, tags="bar")
+                    if t > 0.9 and val:
+                        c.create_text(x0 + bw / 2, y0 - 8, text=fmt(val), fill=C["text"], font=FONT_S, tags="bar")
+            except tk.TclError:
+                pass
+        if animate_in:
+            animate(self.app, 500, draw)
+        else:
+            draw(1.0)
+
+    def _draw_payment_bar(self):
+        c = self.pm_canvas
+        try:
+            w = c.winfo_width()
+            h = int(c.cget("height"))
+        except tk.TclError:
+            return
+        if w < 20:
+            return
+        c.delete("all")
+        for ch in self.pm_legend.winfo_children():
+            ch.destroy()
+        data = self._pm_data
+        total = sum(amt for _, amt in data)
+        if not data or total <= 0:
+            c.create_rectangle(0, 0, w, h, fill=C["line"], width=0)
+            tk.Label(self.pm_legend, text="Aaj abhi tak koi sale nahi.", bg=C["card"], fg=C["mute"], font=FONT_S)\
+                .pack(side="left")
+            return
+        palette = [C["accent"], C["ok"], C["warn"], C["bad"], C["neutral"], C["accent2"]]
+        x = 0.0
+        for i, (method, amt) in enumerate(data):
+            seg = (amt / total) * w
+            color = palette[i % len(palette)]
+            c.create_rectangle(x, 0, x + seg, h, fill=color, width=0)
+            x += seg
+            chip = tk.Frame(self.pm_legend, bg=C["card"])
+            chip.pack(side="left", padx=(0, 14), pady=(0, 4))
+            tk.Label(chip, text="  ", bg=color, width=2).pack(side="left")
+            tk.Label(chip, text=" %s: %s" % (method, fmt(amt)), bg=C["card"], fg=C["text"], font=FONT_S).pack(side="left")
+
+    def _open_low_item(self):
+        iid = self.low_tbl.selected()
+        if not iid:
+            return
+        row = self.db.one("SELECT name FROM products WHERE id=?", (int(iid),))
+        page = self.app.show_page("products")
+        if page is not None and row is not None:
+            page.qv.set(row["name"])
+            page.refresh()
+
+    def _open_sale(self):
+        iid = self.recent_tbl.selected()
+        if not iid:
+            return
+        InvoiceDialog(self.app, self.app, int(iid), done=False)
+
+
+# NOTE: NAV_ITEMS and PAGE_CLASSES are defined once, at the very end of the final
+# assembled file (after every Page class exists further down).
+# =====================================================================================
+#  CART LINE EDIT DIALOG  (used by the POS page)
+# =====================================================================================
+class CartLineDialog(Modal):
+    def __init__(self, parent, item):
+        super().__init__(parent)
+        self.title(item["name"])
+        self.configure(bg=C["card"])
+        self.resizable(False, False)
+        self.item, self.result = dict(item), None
+        body = tk.Frame(self, bg=C["card"], padx=20, pady=14)
+        body.pack(fill="both", expand=True)
+        head = item["name"] + ((" - IMEI " + item["imei"]) if item.get("imei") else "")
+        tk.Label(body, text=head, font=FONT_B, bg=C["card"], wraplength=280, justify="left")\
+            .grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.qv = tk.StringVar(value=plain(item["qty"]))
+        self.pv = tk.StringVar(value=plain(item["price"]))
+        self.dv = tk.StringVar(value=plain(item.get("disc_pct", 0)))
+        for i, (lbl, var) in enumerate([("Qty", self.qv), ("Price", self.pv), ("Discount %", self.dv)], start=1):
+            tk.Label(body, text=lbl, bg=C["card"], fg=C["mute"], font=FONT_S).grid(row=i, column=0, sticky="w", pady=4)
+            e = entry(body, var, width=14, justify="right")
+            e.grid(row=i, column=1, sticky="e", pady=4)
+            if item.get("imei") and lbl == "Qty":
+                e.config(state="readonly")
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=20, pady=(4, 16))
+        btn(bar, "Save", self.save, "primary").pack(side="right")
+        btn(bar, "Remove", self.remove, "danger").pack(side="right", padx=8)
+        btn(bar, "Cancel", self.destroy, "neutral").pack(side="left")
+        self.bind("<Return>", lambda e: self.save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.go_modal(parent, 340, 260)
+
+    def save(self, _e=None):
+        if not re.fullmatch(r"[\d,]*\.?\d*", self.qv.get().strip()) or \
+           not re.fullmatch(r"[\d,]*\.?\d*", self.pv.get().strip()):
+            messagebox.showwarning("Invalid", "Sahi number likhein.", parent=self)
+            return
+        qty = max(0.001, to_num(self.qv.get(), 1))
+        price = max(0.0, to_num(self.pv.get(), 0))
+        disc = min(100.0, max(0.0, to_num(self.dv.get(), 0)))
+        if self.item.get("imei"):
+            qty = 1
+        it = dict(self.item)
+        it.update(qty=qty, price=price, disc_pct=disc)
+        self.result = ("save", it)
+        self.destroy()
+
+    def remove(self):
+        self.result = ("remove", None)
+        self.destroy()
+
+
+# =====================================================================================
+#  POS / NEW SALE PAGE
+# =====================================================================================
+class POSPage(Page):
+    def build(self):
+        self.header("New Sale", "Product search karein ya IMEI scan/type karein")
+        self.cart = []
+        self._paid_touched = False
+        self.customer_id, self.customer_name = WALKIN_ID, "Walk-in Customer"
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+        left = tk.Frame(body, bg=C["bg"])
+        left.pack(side="left", fill="both", expand=True)
+        right = tk.Frame(body, bg=C["card"], highlightthickness=1, highlightbackground=C["line"],
+                         padx=14, pady=14, width=330)
+        right.pack(side="left", fill="y", padx=(12, 0))
+        right.pack_propagate(False)
+
+        sf = tk.Frame(left, bg=C["bg"])
+        sf.pack(fill="x")
+        self.qv = tk.StringVar()
+        e = entry(sf, self.qv, width=40)
+        e.pack(side="left", fill="x", expand=True, ipady=6)
+        e.bind("<KeyRelease>", lambda ev: self.search())
+        e.bind("<Return>", lambda ev: self.on_enter_search())
+        e.bind("<Down>", lambda ev: self.results.tree.focus_set())
+        btn(sf, "Warranty Check", lambda: warranty_lookup(self.app, self.db), "neutral", small=True).pack(side="left", padx=(8, 0))
+        self.search_entry = e
+
+        self.results = Table(left, [("name", "Product", 190, "w"), ("brand", "Brand", 90, "w"),
+                                    ("price", "Price", 70, "e"), ("stock", "Stock", 60, "e")],
+                             height=5, on_double=self.add_selected)
+        self.results.pack(fill="x", pady=(6, 10))
+        self.results.tree.bind("<Return>", lambda e: self.add_selected())
+
+        tk.Label(left, text="Cart  (double-click a line to edit/remove)", font=FONT_B, bg=C["bg"], fg=C["text"])\
+            .pack(anchor="w")
+        self.cart_tbl = Table(left, [("name", "Item", 190, "w"), ("imei", "IMEI", 110, "w"), ("qty", "Qty", 50, "e"),
+                                     ("price", "Price", 70, "e"), ("disc", "Disc%", 55, "e"), ("total", "Total", 80, "e")],
+                              height=9, on_double=self._edit_selected_line)
+        self.cart_tbl.pack(fill="both", expand=True, pady=(4, 0))
+
+        tk.Label(right, text="Customer", font=FONT_S, bg=C["card"], fg=C["mute"], anchor="w").pack(fill="x")
+        self.cust_lbl = tk.Label(right, text=self.customer_name, font=FONT_B, bg=C["card"], fg=C["text"], anchor="w")
+        self.cust_lbl.pack(fill="x", pady=(0, 4))
+        btn(right, "Change Customer", self.pick_cust, "neutral", small=True).pack(fill="x")
+
+        tk.Frame(right, bg=C["line"], height=1).pack(fill="x", pady=10)
+
+        row = tk.Frame(right, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Discount %", bg=C["card"], fg=C["mute"], font=FONT_S).pack(side="left")
+        self.discv = tk.StringVar(value="0")
+        entry(row, self.discv, width=8, justify="right").pack(side="right")
+
+        row = tk.Frame(right, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Tax %", bg=C["card"], fg=C["mute"], font=FONT_S).pack(side="left")
+        self.taxv = tk.StringVar(value=plain(to_num(self.db.get_setting("tax_pct", "0"))))
+        entry(row, self.taxv, width=8, justify="right").pack(side="right")
+
+        self.discv.trace_add("write", lambda *a: self.recalc())
+        self.taxv.trace_add("write", lambda *a: self.recalc())
+
+        tk.Frame(right, bg=C["line"], height=1).pack(fill="x", pady=10)
+
+        def totrow(label, big=False):
+            r = tk.Frame(right, bg=C["card"]); r.pack(fill="x", pady=2)
+            tk.Label(r, text=label, bg=C["card"], fg=C["mute"] if not big else C["text"],
+                    font=FONT_S if not big else FONT_B).pack(side="left")
+            v = tk.Label(r, text="0", bg=C["card"], fg=C["text"] if not big else C["accent"],
+                        font=FONT_S if not big else ("Segoe UI", 15, "bold"))
+            v.pack(side="right")
+            return v
+        self.lbl_sub = totrow("Subtotal")
+        self.lbl_disc = totrow("Discount")
+        self.lbl_tax = totrow("Tax")
+        self.lbl_total = totrow("TOTAL", big=True)
+
+        tk.Frame(right, bg=C["line"], height=1).pack(fill="x", pady=10)
+
+        row = tk.Frame(right, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Method", bg=C["card"], fg=C["mute"], font=FONT_S).pack(side="left")
+        self.methodv = tk.StringVar(value="Cash")
+        ttk.Combobox(row, textvariable=self.methodv, values=PAY_METHODS, state="readonly", width=14).pack(side="right")
+
+        row = tk.Frame(right, bg=C["card"]); row.pack(fill="x", pady=(8, 2))
+        tk.Label(row, text="Paid", bg=C["card"], fg=C["mute"], font=FONT_S).pack(side="left")
+        self.paidv = tk.StringVar(value="0")
+        pe = entry(row, self.paidv, width=12, justify="right")
+        pe.pack(side="right")
+        pe.bind("<KeyPress>", lambda e: setattr(self, "_paid_touched", True))
+        pe.bind("<Return>", lambda e: self.complete_sale())
+
+        btn(right, "Complete Sale", self.complete_sale, "success").pack(fill="x", pady=(14, 4), ipady=6)
+        btn(right, "Clear Cart", self.clear_cart, "neutral", small=True).pack(fill="x")
+
+        self.search_entry.focus_set()
+        self.refresh_cart()
+
+    # ---- search / add ----
+    def search(self):
+        self.results.clear()
+        text = self.qv.get().strip()
+        if not text:
+            return
+        for p in self.db.search_products(text, limit=8):
+            self.results.add([p["name"], p["brand"], p["price"], "IMEI" if p["track_imei"] else p["stock"]], iid=p["id"])
+
+    def on_enter_search(self):
+        text = self.qv.get().strip()
+        if not text:
+            return
+        hit = self.db.find_imei(text)
+        if hit:
+            self._add_product(dict(hit), imei=hit["imei"], cost=hit["ucost"])
+            self.qv.set("")
+            self.results.clear()
+            return
+        if self.results.count():
+            self.results.select_first()
+            self.add_selected()
+            return
+        p = self.db.one("SELECT * FROM products WHERE active=1 AND barcode=?", (text,))
+        if p:
+            self._add_by_product(dict(p))
+            self.qv.set("")
+        else:
+            messagebox.showinfo("Not found", "Koi product/IMEI/barcode match nahi hua.", parent=self)
+
+    def add_selected(self):
+        iid = self.results.selected()
+        if not iid:
+            return
+        p = self.db.one("SELECT * FROM products WHERE id=?", (int(iid),))
+        if not p:
+            return
+        self._add_by_product(dict(p))
+        self.qv.set("")
+        self.results.clear()
+        self.search_entry.focus_set()
+
+    def _add_by_product(self, p):
+        if p["track_imei"]:
+            fetch = lambda t: [(u["imei"], (u["imei"], u["note"], u["cost"])) for u in self.db.q(
+                "SELECT * FROM imei_units WHERE product_id=? AND status='in_stock' AND imei LIKE ? ORDER BY id",
+                (p["id"], "%" + t + "%"))]
+            imei = ask_pick(self, "Select IMEI / Serial - " + p["name"],
+                            [("imei", "IMEI/Serial", 160, "w"), ("note", "Note", 120, "w"), ("cost", "Cost", 70, "e")], fetch)
+            if not imei:
+                return
+            u = self.db.one("SELECT * FROM imei_units WHERE imei=?", (imei,))
+            self._add_product(p, imei=u["imei"], cost=u["cost"])
+        else:
+            if p["category"] not in NO_STOCK_CATS and p["stock"] <= 0:
+                if not messagebox.askyesno("Out of stock", "%s stock me nahi hai. Phir bhi add karein?" % p["name"], parent=self):
+                    return
+            for it in self.cart:
+                if it["pid"] == p["id"] and not it.get("imei"):
+                    it["qty"] += 1
+                    self.refresh_cart()
+                    return
+            self._add_product(p, cost=p["cost"])
+
+    def _add_product(self, p, imei="", cost=None):
+        self.cart.append({"pid": p["id"], "name": p["name"], "imei": imei, "qty": 1, "price": p["price"],
+                          "cost": cost if cost is not None else p["cost"], "disc_pct": 0,
+                          "warranty": p["warranty_months"] or 0})
+        self.refresh_cart()
+
+    def _edit_selected_line(self):
+        iid = self.cart_tbl.selected()
+        if iid is None:
+            return
+        idx = int(iid)
+        d = CartLineDialog(self, self.cart[idx])
+        d.wait_window()
+        if d.result is None:
+            return
+        action, data = d.result
+        if action == "remove":
+            del self.cart[idx]
+        else:
+            self.cart[idx] = data
+        self.refresh_cart()
+
+    # ---- customer / totals ----
+    def pick_cust(self):
+        cid = pick_customer(self, self.db)
+        if cid:
+            self.customer_id = cid
+            row = self.db.one("SELECT name FROM customers WHERE id=?", (cid,))
+            self.customer_name = row["name"] if row else "Walk-in Customer"
+            self.cust_lbl.config(text=self.customer_name)
+
+    def refresh_cart(self):
+        self.cart_tbl.clear()
+        for i, it in enumerate(self.cart):
+            self.cart_tbl.add([it["name"], it.get("imei") or "", it["qty"], it["price"],
+                              it.get("disc_pct") or "", line_total(it)], iid=i)
+        self.recalc()
+
+    def recalc(self):
+        disc, tax = to_num(self.discv.get()), to_num(self.taxv.get())
+        t = calc_totals(self.cart, disc, tax) if self.cart else {"sub": 0, "disc_amt": 0, "tax_amt": 0, "total": 0}
+        self.lbl_sub.config(text=fmt(t["sub"]))
+        self.lbl_disc.config(text=fmt(t["disc_amt"]))
+        self.lbl_tax.config(text=fmt(t["tax_amt"]))
+        self.lbl_total.config(text=fmt(t["total"]))
+        if not self._paid_touched:
+            self.paidv.set(fmt(t["total"]))
+
+    def clear_cart(self):
+        if self.cart and not messagebox.askyesno("Clear", "Cart clear kar dein?", parent=self):
+            return
+        self.cart = []
+        self._paid_touched = False
+        self.customer_id, self.customer_name = WALKIN_ID, "Walk-in Customer"
+        self.cust_lbl.config(text=self.customer_name)
+        self.discv.set("0")
+        self.refresh_cart()
+        self.search_entry.focus_set()
+
+    def complete_sale(self):
+        if not self.cart:
+            messagebox.showinfo("Empty", "Cart khali hai.", parent=self)
+            return
+        disc, tax, paid = to_num(self.discv.get()), to_num(self.taxv.get()), to_num(self.paidv.get())
+        try:
+            sale_id = self.db.create_sale(self.cart, self.customer_id, disc, tax, paid, self.methodv.get(),
+                                          self.app.user["id"])
+        except ValueError as e:
+            messagebox.showerror("Sale", str(e), parent=self)
+            return
+        self.clear_cart()
+        InvoiceDialog(self.app, self.app, sale_id, done=True)
+
+
+# =====================================================================================
+#  PRODUCTS / INVENTORY PAGE
+# =====================================================================================
+class ProductsPage(Page):
+    def build(self):
+        right = self.header("Products / Inventory", "")
+        btn(right, "+ New Product", self.new_product, "primary").pack(side="right")
+
+        bar = tk.Frame(self, bg=C["bg"])
+        bar.pack(fill="x", padx=16)
+        self.qv = tk.StringVar()
+        e = entry(bar, self.qv, width=34)
+        e.pack(side="left", ipady=5)
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+        self.catv = tk.StringVar(value="All")
+        ttk.Combobox(bar, textvariable=self.catv, values=["All"] + CATEGORIES, state="readonly", width=14).pack(side="left", padx=8)
+        self.catv.trace_add("write", lambda *a: self.refresh())
+        btn(bar, "Export CSV", self.export, "neutral", small=True).pack(side="right")
+
+        self.tbl = Table(self, [("name", "Name", 180, "w"), ("brand", "Brand", 100, "w"), ("category", "Category", 100, "w"),
+                                ("cost", "Cost", 75, "e"), ("price", "Price", 75, "e"), ("stock", "Stock", 70, "e"),
+                                ("imei", "IMEI?", 55, "center")], on_double=self.edit_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+
+        bottom = tk.Frame(self, bg=C["bg"])
+        bottom.pack(fill="x", padx=16, pady=(0, 12))
+        btn(bottom, "Edit", self.edit_selected, "neutral").pack(side="left")
+        btn(bottom, "Manage IMEI / Serial", self.manage_imei, "neutral").pack(side="left", padx=6)
+        btn(bottom, "Deactivate", self.deactivate, "danger").pack(side="left")
+
+    def refresh(self):
+        self.tbl.clear()
+        rows = self.db.search_products(self.qv.get().strip(), self.catv.get(), limit=500)
+        for p in rows:
+            low = p["min_stock"] > 0 and p["stock"] <= p["min_stock"] and not p["track_imei"]
+            self.tbl.add([p["name"], p["brand"], p["category"], p["cost"], p["price"],
+                         "-" if p["track_imei"] else p["stock"], "Yes" if p["track_imei"] else ""],
+                        iid=p["id"], tags=("low",) if low else ())
+
+    def new_product(self):
+        if product_form(self, self.db):
+            self.refresh()
+
+    def _selected_id(self):
+        iid = self.tbl.selected()
+        return int(iid) if iid else None
+
+    def edit_selected(self):
+        pid = self._selected_id()
+        if not pid:
+            messagebox.showinfo("Select", "Pehle product select karein.", parent=self)
+            return
+        if product_form(self, self.db, pid):
+            self.refresh()
+
+    def manage_imei(self):
+        pid = self._selected_id()
+        if not pid:
+            messagebox.showinfo("Select", "Pehle product select karein.", parent=self)
+            return
+        p = self.db.one("SELECT * FROM products WHERE id=?", (pid,))
+        if not p["track_imei"]:
+            messagebox.showinfo("IMEI", "Ye product IMEI/Serial track nahi karta.", parent=self)
+            return
+        IMEIDialog(self, self.app, pid)
+        self.refresh()
+
+    def deactivate(self):
+        pid = self._selected_id()
+        if not pid:
+            return
+        if messagebox.askyesno("Deactivate", "Ye product list se hata dein?", parent=self):
+            self.db.x("UPDATE products SET active=0 WHERE id=?", (pid,))
+            self.refresh()
+
+    def export(self):
+        rows = self.db.search_products(self.qv.get().strip(), self.catv.get(), limit=5000)
+        export_csv(self, ["Name", "Brand", "Category", "Cost", "Price", "Stock", "Track IMEI"],
+                  [[p["name"], p["brand"], p["category"], p["cost"], p["price"], p["stock"], p["track_imei"]] for p in rows],
+                  "products")
+# =====================================================================================
+#  NEW PURCHASE DIALOG
+# =====================================================================================
+class PurchaseDialog(Modal):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app, self.db = app, app.db
+        self.title("New Purchase")
+        self.configure(bg=C["card"])
+        self.lines, self.result = [], None
+        self.supplier_id, self.supplier_name = None, ""
+
+        top = tk.Frame(self, bg=C["card"], padx=16, pady=12)
+        top.pack(fill="x")
+        self.sup_lbl = tk.Label(top, text="Supplier: (select)", font=FONT_B, bg=C["card"], fg=C["text"])
+        self.sup_lbl.pack(side="left")
+        btn(top, "Select Supplier", self.pick_sup, "neutral", small=True).pack(side="left", padx=10)
+
+        pf = tk.Frame(self, bg=C["card"], padx=16)
+        pf.pack(fill="x")
+        self.pv = tk.StringVar()
+        pe = entry(pf, self.pv, width=34)
+        pe.pack(side="left", ipady=5)
+        pe.bind("<KeyRelease>", lambda e: self.search())
+        pe.bind("<Return>", lambda e: self.add_from_search())
+        self.presults = Table(self, [("name", "Product", 190, "w"), ("brand", "Brand", 90, "w"), ("cost", "Last Cost", 80, "e")],
+                              height=4, on_double=self.add_from_search)
+        self.presults.pack(fill="x", padx=16, pady=(6, 8))
+
+        self.line_tbl = Table(self, [("name", "Product", 190, "w"), ("qty", "Qty", 60, "e"), ("cost", "Cost", 80, "e"),
+                                     ("total", "Total", 90, "e")], height=7, on_double=self.edit_line)
+        self.line_tbl.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        bottom = tk.Frame(self, bg=C["card"], padx=16, pady=10)
+        bottom.pack(fill="x")
+        row = tk.Frame(bottom, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Discount %", bg=C["card"], fg=C["mute"]).pack(side="left")
+        self.discv = tk.StringVar(value="0")
+        entry(row, self.discv, width=8, justify="right").pack(side="right")
+
+        row = tk.Frame(bottom, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Total", bg=C["card"], fg=C["mute"]).pack(side="left")
+        self.tot_lbl = tk.Label(row, text="0", bg=C["card"], fg=C["accent"], font=FONT_B)
+        self.tot_lbl.pack(side="right")
+
+        row = tk.Frame(bottom, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Method", bg=C["card"], fg=C["mute"]).pack(side="left")
+        self.methodv = tk.StringVar(value="Cash")
+        ttk.Combobox(row, textvariable=self.methodv, values=PAY_METHODS, state="readonly", width=14).pack(side="right")
+
+        row = tk.Frame(bottom, bg=C["card"]); row.pack(fill="x", pady=2)
+        tk.Label(row, text="Paid", bg=C["card"], fg=C["mute"]).pack(side="left")
+        self.paidv = tk.StringVar(value="0")
+        entry(row, self.paidv, width=12, justify="right").pack(side="right")
+
+        self.discv.trace_add("write", lambda *a: self.recalc())
+
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=16, pady=(0, 14))
+        btn(bar, "Save Purchase", self.save, "success").pack(side="right")
+        btn(bar, "Cancel", self.destroy, "neutral").pack(side="right", padx=8)
+
+        self.recalc()
+        self.go_modal(parent, 640, 640)
+
+    def pick_sup(self):
+        sid = pick_supplier(self, self.db)
+        if sid:
+            self.supplier_id = sid
+            row = self.db.one("SELECT name FROM suppliers WHERE id=?", (sid,))
+            self.supplier_name = row["name"] if row else ""
+            self.sup_lbl.config(text="Supplier: " + self.supplier_name)
+
+    def search(self):
+        self.presults.clear()
+        t = self.pv.get().strip()
+        if not t:
+            return
+        for p in self.db.search_products(t, limit=8):
+            self.presults.add([p["name"], p["brand"], p["cost"]], iid=p["id"])
+
+    def add_from_search(self):
+        iid = self.presults.selected()
+        if not iid:
+            return
+        p = self.db.one("SELECT * FROM products WHERE id=?", (int(iid),))
+        if not p:
+            return
+        if p["track_imei"]:
+            res = ask_form(self, "IMEI / Serial for " + p["name"], [
+                {"key": "cost", "label": "Cost per unit", "type": "num", "default": p["cost"]},
+                {"key": "imeis", "label": "IMEI / Serial numbers (one per line)", "type": "text", "height": 6},
+            ], ok_text="Add")
+            if not res:
+                return
+            valid, bad = parse_imeis(res["imeis"])
+            if not valid:
+                messagebox.showwarning("IMEI", "Koi valid IMEI nahi mila.", parent=self)
+                return
+            if bad:
+                messagebox.showinfo("IMEI", "Invalid (ignore ho gaye): %s" % ", ".join(bad[:6]), parent=self)
+            self.lines.append({"pid": p["id"], "name": p["name"], "qty": len(valid), "cost": res["cost"],
+                              "imeis": valid, "note": ""})
+        else:
+            res = ask_form(self, "Qty / Cost for " + p["name"], [
+                {"key": "qty", "label": "Quantity", "type": "num", "required": True, "default": 1},
+                {"key": "cost", "label": "Cost per unit", "type": "num", "required": True, "default": p["cost"]},
+            ], ok_text="Add")
+            if not res:
+                return
+            self.lines.append({"pid": p["id"], "name": p["name"], "qty": res["qty"], "cost": res["cost"]})
+        self.pv.set("")
+        self.presults.clear()
+        self.refresh_lines()
+
+    def edit_line(self):
+        iid = self.line_tbl.selected()
+        if iid is None:
+            return
+        idx = int(iid)
+        if messagebox.askyesno("Remove", "Ye line remove kar dein?", parent=self):
+            del self.lines[idx]
+            self.refresh_lines()
+
+    def refresh_lines(self):
+        self.line_tbl.clear()
+        for i, l in enumerate(self.lines):
+            self.line_tbl.add([l["name"], l["qty"], l["cost"], round(l["qty"] * l["cost"], 2)], iid=i)
+        self.recalc()
+
+    def recalc(self):
+        sub = round(sum(l["qty"] * l["cost"] for l in self.lines), 2)
+        disc = to_num(self.discv.get())
+        total = round(sub - sub * disc / 100.0, 2)
+        self.tot_lbl.config(text=fmt(total))
+        self.paidv.set(fmt(total))
+
+    def save(self):
+        if not self.supplier_id:
+            messagebox.showwarning("Supplier", "Pehle supplier select karein.", parent=self)
+            return
+        if not self.lines:
+            messagebox.showwarning("Empty", "Kam az kam ek item add karein.", parent=self)
+            return
+        try:
+            pid = self.db.create_purchase(self.supplier_id, self.lines, to_num(self.discv.get()),
+                                          to_num(self.paidv.get()), self.methodv.get(), "", self.app.user["id"])
+        except ValueError as e:
+            messagebox.showerror("Purchase", str(e), parent=self)
+            return
+        self.result = pid
+        messagebox.showinfo("Saved", "Purchase save ho gayi.", parent=self)
+        self.destroy()
+
+
+# =====================================================================================
+#  PURCHASES PAGE
+# =====================================================================================
+class PurchasesPage(Page):
+    def build(self):
+        right = self.header("Purchases", "")
+        btn(right, "+ New Purchase", self.new_purchase, "primary").pack(side="right")
+        self.tbl = Table(self, [("ref", "Ref#", 90, "w"), ("date", "Date", 130, "w"), ("supplier", "Supplier", 160, "w"),
+                                ("total", "Total", 85, "e"), ("paid", "Paid", 85, "e"), ("due", "Due", 85, "e")],
+                         on_double=self.view_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+
+    def refresh(self):
+        self.tbl.clear()
+        for r in self.db.q("SELECT p.*, s.name sn FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id "
+                          "ORDER BY p.id DESC LIMIT 300"):
+            self.tbl.add([r["ref_no"], r["date"][:16], r["sn"], r["total"], r["paid"], r["balance_due"]], iid=r["id"])
+
+    def new_purchase(self):
+        d = PurchaseDialog(self, self.app)
+        d.wait_window()
+        if d.result:
+            self.refresh()
+
+    def view_selected(self):
+        iid = self.tbl.selected()
+        if not iid:
+            return
+        p = self.db.one("SELECT p.*, s.name sn FROM purchases p LEFT JOIN suppliers s ON s.id=p.supplier_id WHERE p.id=?",
+                        (int(iid),))
+        items = self.db.q("SELECT * FROM purchase_items WHERE purchase_id=?", (int(iid),))
+        lines = "\n".join("%s  x%s @ %s = %s" % (it["name"], fmt(it["qty"]), fmt(it["cost"]), fmt(it["line_total"]))
+                          for it in items)
+        messagebox.showinfo(p["ref_no"], "Supplier: %s\nDate: %s\n\n%s\n\nTotal: %s   Paid: %s   Due: %s" % (
+            p["sn"], p["date"][:16], lines, fmt(p["total"]), fmt(p["paid"]), fmt(p["balance_due"])), parent=self)
+
+
+# =====================================================================================
+#  LEDGER / STATEMENT DIALOG  (shared by customers + suppliers)
+# =====================================================================================
+class LedgerDialog(Modal):
+    def __init__(self, parent, app, kind, pid):
+        super().__init__(parent)
+        self.app, self.db, self.kind, self.pid = app, app.db, kind, pid
+        table = "customers" if kind == "customer" else "suppliers"
+        row = self.db.one("SELECT * FROM %s WHERE id=?" % table, (pid,))
+        self.title("Ledger - " + row["name"])
+        self.configure(bg=C["card"])
+        head = tk.Frame(self, bg=C["card"], padx=16, pady=10)
+        head.pack(fill="x")
+        tk.Label(head, text=row["name"], font=("Segoe UI", 14, "bold"), bg=C["card"], fg=C["text"]).pack(side="left")
+        bal = self.db.party_balance(kind, pid)
+        tk.Label(head, text="Balance: %s" % fmt(bal), font=FONT_B, bg=C["card"],
+                fg=C["bad"] if bal > 0.005 else C["ok"]).pack(side="right")
+        self.tbl = Table(self, [("date", "Date", 130, "w"), ("type", "Type", 90, "w"), ("ref", "Ref", 100, "w"),
+                                ("dr", "Debit", 85, "e"), ("cr", "Credit", 85, "e"), ("bal", "Balance", 90, "e")], height=14)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=8)
+        bar = tk.Frame(self, bg=C["card"])
+        bar.pack(fill="x", padx=16, pady=(0, 14))
+        btn(bar, "Record Payment", self.pay, "success").pack(side="left")
+        btn(bar, "Export CSV", self.export, "neutral").pack(side="left", padx=6)
+        btn(bar, "Close", self.destroy, "neutral").pack(side="right")
+        self.load()
+        self.go_modal(parent, 660, 560)
+
+    def load(self):
+        self.tbl.clear()
+        for r in self.db.ledger(self.kind, self.pid):
+            self.tbl.add(r)
+
+    def pay(self):
+        bal = self.db.party_balance(self.kind, self.pid)
+        res = ask_form(self, "Record Payment", [
+            {"key": "amount", "label": "Amount (balance: %s)" % fmt(bal), "type": "num", "required": True},
+            {"key": "method", "label": "Method", "type": "combo", "values": PAY_METHODS, "default": "Cash"},
+            {"key": "note", "label": "Note", "full": True},
+        ], ok_text="Save")
+        if not res:
+            return
+        try:
+            self.db.add_payment(self.kind, self.pid, res["amount"], res["method"], res["note"], self.app.user["id"])
+        except ValueError as e:
+            messagebox.showerror("Payment", str(e), parent=self)
+            return
+        self.load()
+
+    def export(self):
+        export_csv(self, ["Date", "Type", "Ref", "Debit", "Credit", "Balance"], self.db.ledger(self.kind, self.pid), "ledger")
+
+
+# =====================================================================================
+#  CUSTOMERS / SUPPLIERS PAGES  (share almost all logic)
+# =====================================================================================
+class CustomersPage(Page):
+    kind = "customer"
+    title_txt = "Customers"
+
+    def build(self):
+        right = self.header(self.title_txt, "")
+        btn(right, "+ New " + self.kind.title(), self.new_party, "primary").pack(side="right")
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=16)
+        self.qv = tk.StringVar()
+        e = entry(bar, self.qv, width=34)
+        e.pack(side="left", ipady=5)
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+        self.tbl = Table(self, [("name", "Name", 190, "w"), ("phone", "Phone", 120, "w"), ("balance", "Balance", 90, "e")],
+                         on_double=self.open_ledger)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+        bottom = tk.Frame(self, bg=C["bg"]); bottom.pack(fill="x", padx=16, pady=(0, 12))
+        btn(bottom, "Edit", self.edit_selected, "neutral").pack(side="left")
+        btn(bottom, "Statement / Ledger", self.open_ledger, "neutral").pack(side="left", padx=6)
+        btn(bottom, "Record Payment", self.record_payment, "success").pack(side="left")
+
+    def refresh(self):
+        self.tbl.clear()
+        for r in self.db.parties(self.kind, self.qv.get().strip()):
+            self.tbl.add([r["name"], r["phone"], r["balance"]], iid=r["id"], tags=("low",) if r["balance"] > 0.005 else ())
+
+    def new_party(self):
+        if party_form(self, self.db, self.kind):
+            self.refresh()
+
+    def _sel(self):
+        iid = self.tbl.selected()
+        return int(iid) if iid else None
+
+    def edit_selected(self):
+        pid = self._sel()
+        if not pid:
+            messagebox.showinfo("Select", "Pehle select karein.", parent=self)
+            return
+        if party_form(self, self.db, self.kind, pid):
+            self.refresh()
+
+    def open_ledger(self):
+        pid = self._sel()
+        if not pid:
+            messagebox.showinfo("Select", "Pehle select karein.", parent=self)
+            return
+        LedgerDialog(self, self.app, self.kind, pid)
+        self.refresh()
+
+    def record_payment(self):
+        pid = self._sel()
+        if not pid:
+            messagebox.showinfo("Select", "Pehle select karein.", parent=self)
+            return
+        row = self.db.one("SELECT * FROM %s WHERE id=?" % ("customers" if self.kind == "customer" else "suppliers"), (pid,))
+        bal = self.db.party_balance(self.kind, pid)
+        res = ask_form(self, "Record Payment - %s" % row["name"], [
+            {"key": "amount", "label": "Amount (current balance: %s)" % fmt(bal), "type": "num", "required": True},
+            {"key": "method", "label": "Method", "type": "combo", "values": PAY_METHODS, "default": "Cash"},
+            {"key": "note", "label": "Note", "full": True},
+        ], ok_text="Save")
+        if not res:
+            return
+        try:
+            self.db.add_payment(self.kind, pid, res["amount"], res["method"], res["note"], self.app.user["id"])
+        except ValueError as e:
+            messagebox.showerror("Payment", str(e), parent=self)
+            return
+        self.refresh()
+
+
+class SuppliersPage(CustomersPage):
+    kind = "supplier"
+    title_txt = "Suppliers"
+# =====================================================================================
+#  REPAIRS / JOB CARDS PAGE
+# =====================================================================================
+class RepairsPage(Page):
+    def build(self):
+        right = self.header("Repairs / Job Cards", "")
+        btn(right, "+ New Job", self.new_job, "primary").pack(side="right")
+
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=16)
+        self.statusv = tk.StringVar(value="Pending")
+        ttk.Combobox(bar, textvariable=self.statusv, values=["Pending", "All"] + REPAIR_STATUS, state="readonly", width=16)\
+            .pack(side="left")
+        self.statusv.trace_add("write", lambda *a: self.refresh())
+        self.qv = tk.StringVar()
+        e = entry(bar, self.qv, width=28)
+        e.pack(side="left", padx=8, ipady=5)
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+
+        self.tbl = Table(self, [("job", "Job#", 85, "w"), ("date", "Date In", 110, "w"), ("customer", "Customer", 140, "w"),
+                                ("device", "Device", 130, "w"), ("status", "Status", 110, "w"), ("charge", "Charge", 80, "e")],
+                         on_double=self.edit_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+
+        bottom = tk.Frame(self, bg=C["bg"]); bottom.pack(fill="x", padx=16, pady=(0, 12))
+        btn(bottom, "Edit / Update Status", self.edit_selected, "neutral").pack(side="left")
+        btn(bottom, "Print Slip", self.print_slip, "neutral").pack(side="left", padx=6)
+        btn(bottom, "WhatsApp Customer", self.wa_customer, "success").pack(side="left")
+
+    def refresh(self):
+        self.tbl.clear()
+        st = self.statusv.get()
+        sql = "SELECT * FROM repairs WHERE 1=1"
+        args = []
+        if st == "Pending":
+            sql += " AND status NOT IN ('Delivered','Cancelled')"
+        elif st != "All":
+            sql += " AND status=?"
+            args.append(st)
+        if self.qv.get().strip():
+            sql += " AND (customer_name LIKE ? OR device LIKE ? OR job_no LIKE ? OR imei LIKE ?)"
+            args += ["%" + self.qv.get().strip() + "%"] * 4
+        sql += " ORDER BY id DESC LIMIT 300"
+        for r in self.db.q(sql, args):
+            self.tbl.add([r["job_no"], r["date_in"][:16], r["customer_name"], r["device"], r["status"],
+                         r["final_charge"] or r["estimate"]], iid=r["id"], tags=("ok",) if r["status"] == "Delivered" else ())
+
+    def _fields(self):
+        return [
+            {"key": "customer_name", "label": "Customer name", "required": True},
+            {"key": "phone", "label": "Phone / WhatsApp"},
+            {"key": "device", "label": "Device (e.g. iPhone 11)", "required": True},
+            {"key": "imei", "label": "IMEI / Serial"},
+            {"key": "problem", "label": "Problem", "type": "text", "full": True, "height": 3},
+            {"key": "estimate", "label": "Estimate charge", "type": "num"},
+            {"key": "advance", "label": "Advance received", "type": "num"},
+            {"key": "technician", "label": "Technician"},
+            {"key": "status", "label": "Status", "type": "combo", "values": REPAIR_STATUS, "default": "Received"},
+            {"key": "final_charge", "label": "Final charge (on delivery)", "type": "num"},
+            {"key": "parts_cost", "label": "Parts cost", "type": "num"},
+            {"key": "note", "label": "Note", "full": True},
+        ]
+
+    def new_job(self):
+        res = ask_form(self, "New Repair Job", self._fields())
+        if res:
+            self.db.save_repair(res, self.app.user["id"])
+            self.refresh()
+
+    def _sel(self):
+        iid = self.tbl.selected()
+        return int(iid) if iid else None
+
+    def edit_selected(self):
+        rid = self._sel()
+        if not rid:
+            messagebox.showinfo("Select", "Pehle job select karein.", parent=self)
+            return
+        init = dict(self.db.one("SELECT * FROM repairs WHERE id=?", (rid,)))
+        res = ask_form(self, "Edit Job " + init["job_no"], self._fields(), init)
+        if res:
+            self.db.save_repair(res, self.app.user["id"], rid)
+            self.refresh()
+
+    def print_slip(self):
+        rid = self._sel()
+        if not rid:
+            return
+        job = self.db.one("SELECT * FROM repairs WHERE id=?", (rid,))
+        path = INVOICE_DIR / ("%s.html" % job["job_no"])
+        path.write_text(repair_slip_html(job, self.db.settings()), encoding="utf-8")
+        open_html(path)
+
+    def wa_customer(self):
+        rid = self._sel()
+        if not rid:
+            return
+        job = self.db.one("SELECT * FROM repairs WHERE id=?", (rid,))
+        msg = "Assalam-o-Alaikum %s,\nAapka %s (Job %s) - status: %s.\nCharge: %s %s" % (
+            job["customer_name"], job["device"], job["job_no"], job["status"],
+            self.db.get_setting("currency", "Rs"), fmt(job["final_charge"] or job["estimate"]))
+        act_whatsapp_text(self, self.db, job["phone"], msg)
+
+
+# =====================================================================================
+#  EXPENSES PAGE
+# =====================================================================================
+class ExpensesPage(Page):
+    def build(self):
+        right = self.header("Expenses", "")
+        btn(right, "+ New Expense", self.new_expense, "primary").pack(side="right")
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=16)
+        tk.Label(bar, text="From", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d1 = tk.StringVar(value=today_str()[:8] + "01")
+        entry(bar, self.d1, width=12).pack(side="left", padx=(4, 10))
+        tk.Label(bar, text="To", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d2 = tk.StringVar(value=today_str())
+        entry(bar, self.d2, width=12).pack(side="left", padx=4)
+        btn(bar, "Filter", self.refresh, "neutral", small=True).pack(side="left", padx=8)
+        self.total_lbl = tk.Label(bar, text="", bg=C["bg"], fg=C["bad"], font=FONT_B)
+        self.total_lbl.pack(side="right")
+
+        self.tbl = Table(self, [("date", "Date", 130, "w"), ("category", "Category", 130, "w"),
+                                ("amount", "Amount", 90, "e"), ("note", "Note", 220, "w")], on_double=self.edit_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+
+    def refresh(self):
+        try:
+            d1, d2 = parse_date(self.d1.get()), parse_date(self.d2.get())
+        except ValueError:
+            messagebox.showwarning("Date", "YYYY-MM-DD format use karein.", parent=self)
+            return
+        self.tbl.clear()
+        tot = 0.0
+        for r in self.db.q("SELECT * FROM expenses WHERE date BETWEEN ? AND ? ORDER BY date DESC, id DESC", (d1, d2)):
+            self.tbl.add([r["date"][:16], r["category"], r["amount"], r["note"]], iid=r["id"])
+            tot += r["amount"]
+        self.total_lbl.config(text="Total: %s" % fmt(tot))
+
+    def new_expense(self):
+        res = ask_form(self, "New Expense", [
+            {"key": "category", "label": "Category", "type": "combo", "values": EXPENSE_CATS, "default": "Other"},
+            {"key": "amount", "label": "Amount", "type": "num", "required": True},
+            {"key": "note", "label": "Note", "full": True},
+        ])
+        if res:
+            self.db.x("INSERT INTO expenses(date,category,amount,note,user_id) VALUES(?,?,?,?,?)",
+                      (now_str(), res["category"], res["amount"], res["note"], self.app.user["id"]))
+            self.refresh()
+
+    def edit_selected(self):
+        iid = self.tbl.selected()
+        if not iid:
+            return
+        rid = int(iid)
+        init = dict(self.db.one("SELECT * FROM expenses WHERE id=?", (rid,)))
+        res = ask_form(self, "Edit Expense", [
+            {"key": "category", "label": "Category", "type": "combo", "values": EXPENSE_CATS},
+            {"key": "amount", "label": "Amount", "type": "num", "required": True},
+            {"key": "note", "label": "Note", "full": True},
+        ], init)
+        if res:
+            self.db.x("UPDATE expenses SET category=?, amount=?, note=? WHERE id=?",
+                      (res["category"], res["amount"], res["note"], rid))
+            self.refresh()
+
+
+# =====================================================================================
+#  REPORTS PAGE
+# =====================================================================================
+class ReportsPage(Page):
+    def build(self):
+        self.header("Reports", "")
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=16)
+        tk.Label(bar, text="Report", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.repv = tk.StringVar(value=REPORTS[0][0])
+        ttk.Combobox(bar, textvariable=self.repv, values=[r[0] for r in REPORTS], state="readonly", width=28)\
+            .pack(side="left", padx=(4, 14))
+        tk.Label(bar, text="From", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d1 = tk.StringVar(value=today_str()[:8] + "01")
+        entry(bar, self.d1, width=12).pack(side="left", padx=(4, 10))
+        tk.Label(bar, text="To", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d2 = tk.StringVar(value=today_str())
+        entry(bar, self.d2, width=12).pack(side="left", padx=4)
+        btn(bar, "Run", self.run, "primary", small=True).pack(side="left", padx=8)
+        btn(bar, "Print", self.print_it, "neutral", small=True).pack(side="right")
+        btn(bar, "Export CSV", self.export, "neutral", small=True).pack(side="right", padx=6)
+
+        self.tbl_frame = tk.Frame(self, bg=C["bg"])
+        self.tbl_frame.pack(fill="both", expand=True, padx=16, pady=10)
+        self.tbl = None
+        self._headers, self._rows = [], []
+
+    def refresh(self):
+        self.run()
+
+    def run(self):
+        try:
+            d1, d2 = parse_date(self.d1.get()), parse_date(self.d2.get())
+        except ValueError:
+            messagebox.showwarning("Date", "YYYY-MM-DD format use karein.", parent=self)
+            return
+        fn = dict(REPORTS)[self.repv.get()]
+        headers, rows, tot = fn(self.db, d1, d2)
+        self._headers, self._rows = headers, rows
+        if self.tbl is not None:
+            self.tbl.destroy()
+        self.tbl = Table(self.tbl_frame, [(str(i), h, 120, "e" if i > 0 else "w") for i, h in enumerate(headers)], height=16)
+        self.tbl.pack(fill="both", expand=True)
+        for r in rows:
+            self.tbl.add(r)
+        if tot:
+            self.tbl.add(tot, tags=("total",))
+
+    def print_it(self):
+        if not self._headers:
+            self.run()
+        print_table(self.db, self.repv.get(), self._headers, self._rows, "%s to %s" % (self.d1.get(), self.d2.get()))
+
+    def export(self):
+        if not self._headers:
+            self.run()
+        export_csv(self, self._headers, self._rows, self.repv.get().replace(" ", "_"))
+
+
+# =====================================================================================
+#  USERS & ROLES PAGE  (admin only)
+# =====================================================================================
+class UsersPage(Page):
+    def build(self):
+        right = self.header("Users & Roles", "")
+        btn(right, "+ New User", self.new_user, "primary").pack(side="right")
+        self.tbl = Table(self, [("username", "Username", 140, "w"), ("full_name", "Full Name", 160, "w"),
+                                ("role", "Role", 90, "w"), ("active", "Active", 70, "center")], on_double=self.edit_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+        bottom = tk.Frame(self, bg=C["bg"]); bottom.pack(fill="x", padx=16, pady=(0, 12))
+        btn(bottom, "Edit / Reset Password", self.edit_selected, "neutral").pack(side="left")
+        btn(bottom, "Toggle Active", self.toggle_active, "danger").pack(side="left", padx=6)
+
+    def refresh(self):
+        self.tbl.clear()
+        for r in self.db.q("SELECT * FROM users ORDER BY username COLLATE NOCASE"):
+            self.tbl.add([r["username"], r["full_name"], r["role"], "Yes" if r["active"] else "No"], iid=r["id"])
+
+    def new_user(self):
+        res = ask_form(self, "New User", [
+            {"key": "username", "label": "Username", "required": True},
+            {"key": "full_name", "label": "Full name"},
+            {"key": "role", "label": "Role", "type": "combo", "values": ROLES, "default": "cashier"},
+            {"key": "password", "label": "Password", "type": "password", "required": True},
+        ])
+        if not res:
+            return
+        if self.db.one("SELECT id FROM users WHERE username=?", (res["username"].strip(),)):
+            messagebox.showwarning("Exists", "Ye username pehle se hai.", parent=self)
+            return
+        self.db.add_user(res["username"], res["password"], res["role"], res["full_name"])
+        self.refresh()
+
+    def _sel(self):
+        iid = self.tbl.selected()
+        return int(iid) if iid else None
+
+    def edit_selected(self):
+        uid = self._sel()
+        if not uid:
+            messagebox.showinfo("Select", "Pehle user select karein.", parent=self)
+            return
+        u = self.db.one("SELECT * FROM users WHERE id=?", (uid,))
+        res = ask_form(self, "Edit User - " + u["username"], [
+            {"key": "full_name", "label": "Full name", "default": u["full_name"]},
+            {"key": "role", "label": "Role", "type": "combo", "values": ROLES, "default": u["role"]},
+            {"key": "password", "label": "New password (khali chorein agar change nahi karna)", "type": "password"},
+        ])
+        if not res:
+            return
+        if u["role"] == "admin" and res["role"] != "admin" and self.db.admin_count() <= 1:
+            messagebox.showwarning("Blocked", "Kam az kam ek admin hona zaroori hai.", parent=self)
+            return
+        self.db.x("UPDATE users SET full_name=?, role=? WHERE id=?", (res["full_name"], res["role"], uid))
+        if res["password"].strip():
+            self.db.set_password(uid, res["password"], must_change=1)
+        self.refresh()
+
+    def toggle_active(self):
+        uid = self._sel()
+        if not uid:
+            return
+        u = self.db.one("SELECT * FROM users WHERE id=?", (uid,))
+        if u["role"] == "admin" and u["active"] and self.db.admin_count() <= 1:
+            messagebox.showwarning("Blocked", "Aakhri active admin ko disable nahi kar sakte.", parent=self)
+            return
+        if u["id"] == self.app.user["id"]:
+            messagebox.showwarning("Blocked", "Apna hi account disable nahi kar sakte.", parent=self)
+            return
+        self.db.x("UPDATE users SET active=? WHERE id=?", (0 if u["active"] else 1, uid))
+        self.refresh()
+
+
+# =====================================================================================
+#  SETTINGS PAGE  (admin only) - shop info, license activation, backup
+# =====================================================================================
+class SettingsPage(Page):
+    def build(self):
+        self.header("Settings", "")
+        outer = tk.Frame(self, bg=C["bg"])
+        outer.pack(fill="both", expand=True, padx=16, pady=(0, 12))
+
+        left = tk.Frame(outer, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], padx=18, pady=16)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        tk.Label(left, text="Shop Settings", font=FONT_B, bg=C["card"], fg=C["text"]).pack(anchor="w", pady=(0, 8))
+
+        cfg = self.db.settings()
+        self.vars = {}
+        fields = [
+            ("shop_name", "Shop Name"), ("shop_address", "Address"), ("shop_phone", "Phone"),
+            ("invoice_prefix", "Invoice Prefix"), ("currency", "Currency Symbol"), ("tax_pct", "Tax %"),
+            ("country_code", "WhatsApp Country Code"),
+        ]
+        for key, label in fields:
+            row = tk.Frame(left, bg=C["card"]); row.pack(fill="x", pady=4)
+            tk.Label(row, text=label, bg=C["card"], fg=C["mute"], font=FONT_S, width=20, anchor="w").pack(side="left")
+            v = tk.StringVar(value=cfg.get(key, ""))
+            entry(row, v, width=24).pack(side="left", fill="x", expand=True)
+            self.vars[key] = v
+
+        row = tk.Frame(left, bg=C["card"]); row.pack(fill="x", pady=4)
+        tk.Label(row, text="Paper Size", bg=C["card"], fg=C["mute"], font=FONT_S, width=20, anchor="w").pack(side="left")
+        self.paperv = tk.StringVar(value=cfg.get("paper", "80mm"))
+        ttk.Combobox(row, textvariable=self.paperv, values=["80mm", "A4"], state="readonly", width=10).pack(side="left")
+
+        for key, label in [("invoice_footer", "Invoice Footer"), ("warranty_note", "Warranty Note"),
+                          ("repair_terms", "Repair Terms")]:
+            tk.Label(left, text=label, bg=C["card"], fg=C["mute"], font=FONT_S, anchor="w").pack(fill="x", pady=(8, 0))
+            t = tk.Text(left, height=2, font=FONT, relief="flat", highlightthickness=1, highlightbackground=C["line"], wrap="word")
+            t.insert("1.0", cfg.get(key, ""))
+            t.pack(fill="x")
+            self.vars[key] = t
+
+        btn(left, "Save Settings", self.save, "primary").pack(anchor="w", pady=(14, 0))
+
+        right = tk.Frame(outer, bg=C["card"], highlightthickness=1, highlightbackground=C["line"], padx=18, pady=16, width=300)
+        right.pack(side="left", fill="y")
+        right.pack_propagate(False)
+        tk.Label(right, text="License", font=FONT_B, bg=C["card"], fg=C["text"]).pack(anchor="w")
+        self.lic_lbl = tk.Label(right, text="", font=FONT_S, bg=C["card"], wraplength=250, justify="left")
+        self.lic_lbl.pack(anchor="w", pady=(4, 10))
+        btn(right, "Activate License", self.activate, "primary", small=True).pack(fill="x")
+
+        tk.Frame(right, bg=C["line"], height=1).pack(fill="x", pady=14)
+        tk.Label(right, text="Backup", font=FONT_B, bg=C["card"], fg=C["text"]).pack(anchor="w")
+        tk.Label(right, text="Data folder:\n%s" % DATA_DIR, font=FONT_S, bg=C["card"], fg=C["mute"],
+                wraplength=250, justify="left").pack(anchor="w", pady=(4, 10))
+        btn(right, "Backup Now", self.backup_now, "neutral", small=True).pack(fill="x")
+        btn(right, "Open Backup Folder", lambda: open_path(BACKUP_DIR), "neutral", small=True).pack(fill="x", pady=6)
+
+    def refresh(self):
+        st = license_status(self.db)
+        color = {"licensed": C["ok"], "trial": C["warn"], "expired": C["bad"], "tampered": C["bad"]}.get(st["state"], C["mute"])
+        self.lic_lbl.config(text=st["text"] + "\nMachine ID: " + machine_id(), fg=color)
+
+    def save(self):
+        for key, v in self.vars.items():
+            val = v.get("1.0", "end").strip() if isinstance(v, tk.Text) else v.get().strip()
+            self.db.set_setting(key, val)
+        self.db.set_setting("paper", self.paperv.get())
+        messagebox.showinfo("Saved", "Settings save ho gayin.", parent=self)
+        self.app._refresh_license_label()
+
+    def activate(self):
+        if open_activation(self, self.db):
+            self.refresh()
+            self.app._refresh_license_label()
+
+    def backup_now(self):
+        try:
+            path = backup_db(self.db, tag="manual")
+            messagebox.showinfo("Backup", "Backup ho gaya:\n%s" % path, parent=self)
+        except Exception as e:
+            messagebox.showerror("Backup", str(e), parent=self)
+
+# =====================================================================================
+#  SALES / INVOICE HISTORY PAGE
+# =====================================================================================
+class SalesPage(Page):
+    def build(self):
+        self.header("Sales / Invoices", "Purani invoice dobara kholein - print, PDF, WhatsApp ya return")
+        bar = tk.Frame(self, bg=C["bg"]); bar.pack(fill="x", padx=16)
+        tk.Label(bar, text="From", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d1 = tk.StringVar(value=today_str()[:8] + "01")
+        entry(bar, self.d1, width=12).pack(side="left", padx=(4, 10))
+        tk.Label(bar, text="To", bg=C["bg"], fg=C["mute"]).pack(side="left")
+        self.d2 = tk.StringVar(value=today_str())
+        entry(bar, self.d2, width=12).pack(side="left", padx=4)
+        self.qv = tk.StringVar()
+        e = entry(bar, self.qv, width=24)
+        e.pack(side="left", padx=(10, 0), ipady=5)
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+        btn(bar, "Today", self.today, "neutral", small=True).pack(side="left", padx=(8, 0))
+        btn(bar, "Filter", self.refresh, "primary", small=True).pack(side="left", padx=6)
+        btn(bar, "Export CSV", self.export, "neutral", small=True).pack(side="right")
+
+        self.tbl = Table(self, [("inv", "Invoice", 110, "w"), ("date", "Date", 130, "w"), ("customer", "Customer", 160, "w"),
+                                ("total", "Total", 85, "e"), ("paid", "Paid", 85, "e"), ("due", "Due", 80, "e"),
+                                ("method", "Method", 100, "w")], on_double=self.open_selected)
+        self.tbl.pack(fill="both", expand=True, padx=16, pady=10)
+        self.total_lbl = tk.Label(self, text="", bg=C["bg"], fg=C["mute"], font=FONT_S, anchor="w")
+        self.total_lbl.pack(fill="x", padx=16, pady=(0, 10))
+
+    def today(self):
+        self.d1.set(today_str())
+        self.d2.set(today_str())
+        self.refresh()
+
+    def refresh(self):
+        try:
+            d1, d2 = parse_date(self.d1.get()), parse_date(self.d2.get())
+        except ValueError:
+            messagebox.showwarning("Date", "YYYY-MM-DD format use karein.", parent=self)
+            return
+        sql = ("SELECT s.id, s.invoice_no, s.date, s.total, s.paid, s.balance_due, s.method, c.name cn "
+              "FROM sales s LEFT JOIN customers c ON c.id=s.customer_id WHERE substr(s.date,1,10) BETWEEN ? AND ?")
+        args = [d1, d2]
+        if self.qv.get().strip():
+            sql += " AND (s.invoice_no LIKE ? OR c.name LIKE ?)"
+            args += ["%" + self.qv.get().strip() + "%"] * 2
+        sql += " ORDER BY s.id DESC LIMIT 500"
+        self.tbl.clear()
+        tot = 0.0
+        for r in self.db.q(sql, args):
+            self.tbl.add([r["invoice_no"], r["date"][:16], r["cn"], r["total"], r["paid"], r["balance_due"], r["method"]],
+                        iid=r["id"])
+            tot += r["total"]
+        self.total_lbl.config(text="%d invoice(s)   Total sales: %s" % (self.tbl.count(), fmt(tot)))
+
+    def open_selected(self):
+        iid = self.tbl.selected()
+        if not iid:
+            return
+        InvoiceDialog(self.app, self.app, int(iid), done=False)
+
+    def export(self):
+        rows = self.db.q("SELECT s.invoice_no, s.date, c.name cn, s.total, s.paid, s.balance_due, s.method "
+                         "FROM sales s LEFT JOIN customers c ON c.id=s.customer_id ORDER BY s.id DESC LIMIT 5000")
+        export_csv(self, ["Invoice", "Date", "Customer", "Total", "Paid", "Due", "Method"],
+                  [[r["invoice_no"], r["date"][:16], r["cn"], r["total"], r["paid"], r["balance_due"], r["method"]] for r in rows],
+                  "sales")
+# =====================================================================================
+#  NAVIGATION WIRING  (all Page classes exist above this point)
+# =====================================================================================
+PAGE_CLASSES = {
+    "dashboard": DashboardPage,
+    "pos": POSPage,
+    "sales": SalesPage,
+    "products": ProductsPage,
+    "purchases": PurchasesPage,
+    "customers": CustomersPage,
+    "suppliers": SuppliersPage,
+    "repairs": RepairsPage,
+    "expenses": ExpensesPage,
+    "reports": ReportsPage,
+    "users": UsersPage,
+    "settings": SettingsPage,
+}
+
+NAV_ITEMS = [
+    {"key": "dashboard", "label": "Dashboard", "icon": "\U0001F4CA", "min_role": 1, "hotkey": "F1"},
+    {"key": "pos", "label": "New Sale", "icon": "\U0001F6D2", "min_role": 1, "hotkey": "F2"},
+    {"key": "sales", "label": "Sales / Invoices", "icon": "\U0001F9FE", "min_role": 1, "hotkey": "F3"},
+    {"key": "products", "label": "Products", "icon": "\U0001F4E6", "min_role": 2, "hotkey": "F4"},
+    {"key": "purchases", "label": "Purchases", "icon": "\U0001F69A", "min_role": 2, "hotkey": "F5"},
+    {"key": "customers", "label": "Customers", "icon": "\U0001F465", "min_role": 1, "hotkey": "F6"},
+    {"key": "suppliers", "label": "Suppliers", "icon": "\U0001F3ED", "min_role": 2, "hotkey": "F7"},
+    {"key": "repairs", "label": "Repairs", "icon": "\U0001F527", "min_role": 1, "hotkey": "F8"},
+    {"key": "expenses", "label": "Expenses", "icon": "\U0001F4B8", "min_role": 2, "hotkey": "F9"},
+    {"key": "reports", "label": "Reports", "icon": "\U0001F4C8", "min_role": 2, "hotkey": "F10"},
+    {"key": "users", "label": "Users", "icon": "\U0001F464", "min_role": 3},
+    {"key": "settings", "label": "Settings", "icon": "\u2699", "min_role": 3},
+]
+
+
+# =====================================================================================
+#  ENTRY POINT
+# =====================================================================================
+if __name__ == "__main__":
+    App().mainloop()
+
+
